@@ -1,0 +1,507 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://basidekick.com/schemas/device-profile/v1",
+  "title": "BAS Simulator Device Profile Schema v1",
+  "description": "Defines a piece of equipment for simulation, including its points, protocol mappings, behavior rules, and FMU variable bindings.",
+  "_commentary": {
+    "design_principles": [
+      "Equipment-centric: one file per physical device (AHU, VAV, chiller, etc.)",
+      "Protocol-agnostic at the point level: each point optionally maps to BACnet, Modbus, or both",
+      "Behavior is placeholder: simple rules that the FMU physics engine replaces later",
+      "FMU mapping is optional: absent until physics integration step",
+      "Points reference engineering units and value constraints for validation"
+    ]
+  },
+  "type": "object",
+  "required": [
+    "profile",
+    "points"
+  ],
+  "properties": {
+    "profile": {
+      "type": "object",
+      "description": "Metadata about this device profile",
+      "required": [
+        "id",
+        "name",
+        "type",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for this profile (used in scenario configs)",
+          "examples": [
+            "ahu-single-duct-vav"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable name",
+          "examples": [
+            "Single Duct AHU with VAV Zones"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ahu",
+            "vav",
+            "rtu",
+            "chiller",
+            "boiler",
+            "pump",
+            "cooling-tower",
+            "fan-coil",
+            "heat-exchanger",
+            "generic"
+          ],
+          "description": "Equipment category"
+        },
+        "version": {
+          "type": "string",
+          "description": "Profile version for tracking changes",
+          "examples": [
+            "1.0.0"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "description": "What this profile represents"
+        },
+        "manufacturer": {
+          "type": "string",
+          "description": "Optional: specific manufacturer this profile approximates"
+        },
+        "model": {
+          "type": "string",
+          "description": "Optional: specific model number"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional: searchable tags for organizing profiles",
+          "examples": [
+            [
+              "hvac",
+              "air-handling",
+              "single-duct",
+              "vav"
+            ]
+          ]
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "description": "Device-level defaults",
+      "properties": {
+        "protocols": {
+          "type": "object",
+          "description": "Default protocol settings applied to all points unless overridden",
+          "properties": {
+            "bacnet": {
+              "type": "object",
+              "properties": {
+                "device_id": {
+                  "type": "integer",
+                  "description": "Default BACnet device instance number"
+                },
+                "device_name": {
+                  "type": "string",
+                  "description": "BACnet device object name"
+                },
+                "vendor_id": {
+                  "type": "integer",
+                  "description": "BACnet vendor identifier"
+                }
+              }
+            },
+            "modbus": {
+              "type": "object",
+              "properties": {
+                "unit_id": {
+                  "type": "integer",
+                  "description": "Default Modbus unit/slave ID"
+                },
+                "byte_order": {
+                  "type": "string",
+                  "enum": [
+                    "big-endian",
+                    "little-endian"
+                  ],
+                  "default": "big-endian"
+                },
+                "word_order": {
+                  "type": "string",
+                  "enum": [
+                    "big-endian",
+                    "little-endian"
+                  ],
+                  "default": "big-endian"
+                }
+              }
+            }
+          },
+          "additionalProperties": {
+            "type": "object",
+            "description": "Future protocol defaults follow the same pattern"
+          }
+        }
+      }
+    },
+    "points": {
+      "type": "array",
+      "description": "All points this equipment exposes",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "access"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Internal unique identifier for this point within the device",
+            "examples": [
+              "dat"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name",
+            "examples": [
+              "Discharge Air Temp"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "description": "What this point represents physically"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "analog",
+              "binary",
+              "multistate"
+            ],
+            "description": "Value type category"
+          },
+          "access": {
+            "type": "string",
+            "enum": [
+              "input",
+              "output",
+              "value"
+            ],
+            "description": "input = sensor/read-only, output = commandable/writable, value = software point/setpoint"
+          },
+          "units": {
+            "type": "string",
+            "description": "Engineering units",
+            "examples": [
+              "\u00b0F",
+              "%",
+              "cfm",
+              "psi",
+              "in-wc"
+            ]
+          },
+          "initial_value": {
+            "description": "Starting value when simulation begins",
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "constraints": {
+            "type": "object",
+            "description": "Valid value range",
+            "properties": {
+              "min": {
+                "type": "number"
+              },
+              "max": {
+                "type": "number"
+              },
+              "states": {
+                "type": "object",
+                "description": "For multistate points: state number to label mapping",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "examples": [
+                  {
+                    "1": "Off",
+                    "2": "Low",
+                    "3": "High",
+                    "4": "Auto"
+                  }
+                ]
+              }
+            }
+          },
+          "behavior": {
+            "type": "object",
+            "description": "Placeholder behavior rules (replaced by FMU physics later)",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "static",
+                  "daily-curve",
+                  "follows",
+                  "inverse-follows",
+                  "random-drift",
+                  "on-off-cycle",
+                  "computed"
+                ],
+                "description": "static=fixed value, daily-curve=sine over 24hrs, follows=tracks another point, inverse-follows=inverse relationship, random-drift=wanders within range, on-off-cycle=binary cycling, computed=expression"
+              },
+              "source": {
+                "type": "string",
+                "description": "For follows/inverse-follows: the point ID this tracks",
+                "examples": [
+                  "clg_vlv_cmd"
+                ]
+              },
+              "gain": {
+                "type": "number",
+                "description": "Multiplier for follows behavior",
+                "default": 1.0
+              },
+              "offset": {
+                "type": "number",
+                "description": "Offset for follows behavior",
+                "default": 0.0
+              },
+              "lag_seconds": {
+                "type": "number",
+                "description": "Time delay before responding to changes",
+                "default": 0
+              },
+              "noise": {
+                "type": "number",
+                "description": "Random noise amplitude to add to value",
+                "default": 0
+              },
+              "curve": {
+                "type": "object",
+                "description": "For daily-curve: defines the 24-hour pattern",
+                "properties": {
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "peak_hour": {
+                    "type": "number",
+                    "description": "Hour of day (0-23) when value peaks",
+                    "default": 14
+                  }
+                }
+              },
+              "expression": {
+                "type": "string",
+                "description": "For computed: simple expression referencing other point IDs",
+                "examples": [
+                  "(oat * 0.3) + (rat * 0.7)"
+                ]
+              }
+            }
+          },
+          "fmu": {
+            "type": "object",
+            "description": "FMU variable mapping (added when physics integration is done)",
+            "properties": {
+              "variable": {
+                "type": "string",
+                "description": "FMU model description variable name",
+                "examples": [
+                  "ahu.dischargeAir.T"
+                ]
+              },
+              "transform": {
+                "type": "object",
+                "description": "Unit conversion between FMU value and point value",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "linear",
+                      "kelvin-to-fahrenheit",
+                      "celsius-to-fahrenheit",
+                      "pa-to-inwc",
+                      "none"
+                    ],
+                    "default": "none"
+                  },
+                  "scale": {
+                    "type": "number",
+                    "default": 1.0
+                  },
+                  "offset": {
+                    "type": "number",
+                    "default": 0.0
+                  }
+                }
+              }
+            }
+          },
+          "ui": {
+            "type": "object",
+            "description": "Display hints for visualization",
+            "properties": {
+              "group": {
+                "type": "string",
+                "description": "UI grouping category",
+                "examples": [
+                  "Air Handling",
+                  "Cooling",
+                  "Heating",
+                  "Zone"
+                ]
+              },
+              "color": {
+                "type": "string",
+                "description": "Trend line color hint"
+              },
+              "precision": {
+                "type": "integer",
+                "description": "Decimal places to display",
+                "default": 1
+              },
+              "trend": {
+                "type": "boolean",
+                "description": "Whether to auto-trend this point",
+                "default": false
+              }
+            }
+          },
+          "protocols": {
+            "type": "object",
+            "description": "Protocol-specific mappings for this point. Each key is a protocol name.",
+            "properties": {
+              "bacnet": {
+                "type": "object",
+                "description": "BACnet protocol mapping",
+                "properties": {
+                  "object_type": {
+                    "type": "string",
+                    "enum": [
+                      "analog-input",
+                      "analog-output",
+                      "analog-value",
+                      "binary-input",
+                      "binary-output",
+                      "binary-value",
+                      "multistate-input",
+                      "multistate-output",
+                      "multistate-value"
+                    ]
+                  },
+                  "instance": {
+                    "type": "integer",
+                    "description": "BACnet object instance number"
+                  },
+                  "object_name": {
+                    "type": "string",
+                    "description": "BACnet object name (if different from point name)"
+                  },
+                  "cov_increment": {
+                    "type": "number",
+                    "description": "Change-of-value reporting increment"
+                  },
+                  "priority": {
+                    "type": "integer",
+                    "description": "For commandable objects: default write priority (1-16)",
+                    "minimum": 1,
+                    "maximum": 16
+                  }
+                }
+              },
+              "modbus": {
+                "type": "object",
+                "description": "Modbus protocol mapping",
+                "properties": {
+                  "register_type": {
+                    "type": "string",
+                    "enum": [
+                      "holding",
+                      "input",
+                      "coil",
+                      "discrete-input"
+                    ]
+                  },
+                  "address": {
+                    "type": "integer",
+                    "description": "Register address (0-based)"
+                  },
+                  "data_type": {
+                    "type": "string",
+                    "enum": [
+                      "uint16",
+                      "int16",
+                      "uint32",
+                      "int32",
+                      "float32",
+                      "float64",
+                      "bool"
+                    ],
+                    "default": "float32"
+                  },
+                  "scale": {
+                    "type": "number",
+                    "description": "Multiplier: register_value = point_value * scale",
+                    "default": 1.0
+                  },
+                  "register_count": {
+                    "type": "integer",
+                    "description": "Number of registers this value spans",
+                    "default": 1
+                  }
+                }
+              }
+            },
+            "additionalProperties": {
+              "type": "object",
+              "description": "Future protocols added as new keys here"
+            }
+          },
+          "haystack": {
+            "type": "object",
+            "description": "Future: Haystack tag set for this point",
+            "properties": {
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "examples": [
+                  [
+                    "discharge",
+                    "air",
+                    "temp",
+                    "sensor"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
