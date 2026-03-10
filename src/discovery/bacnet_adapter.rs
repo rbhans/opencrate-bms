@@ -157,6 +157,7 @@ mod tests {
                     writable: false,
                 },
             ],
+            trend_logs: vec![],
         }
     }
 

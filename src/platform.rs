@@ -79,7 +79,8 @@ pub async fn init_platform(
     let bacnet_config = bacnet_config_from_scenario(&loaded.config.settings);
     let mut bacnet = BacnetBridge::new()
         .with_bacnet_config(bacnet_config)
-        .with_event_bus(event_bus.clone());
+        .with_event_bus(event_bus.clone())
+        .with_history_store(history_store.clone());
     if let Err(e) = bacnet.start(point_store.clone()).await {
         eprintln!("BACnet bridge error: {e}");
     }

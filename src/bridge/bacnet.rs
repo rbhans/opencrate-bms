@@ -109,6 +109,14 @@ pub struct BacnetDevice {
     pub model: Option<String>,
     pub firmware_revision: Option<String>,
     pub objects: Vec<BacnetObject>,
+    pub trend_logs: Vec<TrendLogRef>,
+}
+
+/// Reference to a TrendLog object on a remote device.
+#[derive(Debug, Clone)]
+pub struct TrendLogRef {
+    pub object_id: ObjectId,
+    pub object_name: Option<String>,
 }
 
 /// A BACnet object discovered via device walk.
@@ -158,6 +166,7 @@ pub struct BacnetBridge {
     /// Maps (device_instance, object_instance) → PointKey for fast lookup
     point_map: HashMap<(u32, u32), ObjectId>,
     store: Option<PointStore>,
+    history_store: Option<HistoryStore>,
     event_bus: Option<EventBus>,
     cov_handle: Option<JoinHandle<()>>,
     poll_handle: Option<JoinHandle<()>>,
@@ -183,6 +192,7 @@ impl BacnetBridge {
             devices: Vec::new(),
             point_map: HashMap::new(),
             store: None,
+            history_store: None,
             event_bus: None,
             cov_handle: None,
             poll_handle: None,
@@ -209,6 +219,11 @@ impl BacnetBridge {
 
     pub fn with_bacnet_config(mut self, config: BacnetConfig) -> Self {
         self.bacnet_config = config;
+        self
+    }
+
+    pub fn with_history_store(mut self, store: HistoryStore) -> Self {
+        self.history_store = Some(store);
         self
     }
 
@@ -670,28 +685,34 @@ impl BacnetBridge {
 
             match with_client!(&tc, |c| walk_device(c, dev.address, device_id).await) {
                 Ok(walk_result) => {
-                    let objects: Vec<BacnetObject> = walk_result
-                        .objects
-                        .into_iter()
-                        .filter(|o| is_point_object(o.object_id.object_type()))
-                        .map(|o| {
+                    let mut objects = Vec::new();
+                    let mut trend_logs = Vec::new();
+
+                    for o in walk_result.objects {
+                        if o.object_id.object_type() == ObjectType::TrendLog {
+                            trend_logs.push(TrendLogRef {
+                                object_id: o.object_id,
+                                object_name: o.object_name,
+                            });
+                        } else if is_point_object(o.object_id.object_type()) {
                             let classification =
                                 rustbac_client::point::classify_point(o.object_id.object_type());
-                            BacnetObject {
+                            objects.push(BacnetObject {
                                 object_id: o.object_id,
                                 object_name: o.object_name,
                                 description: o.description,
                                 units: o.units,
                                 present_value: o.present_value,
                                 writable: classification.writable,
-                            }
-                        })
-                        .collect();
+                            });
+                        }
+                    }
 
                     println!(
-                        "  device {} — {} point object(s)",
+                        "  device {} — {} point(s), {} trend log(s)",
                         device_id.instance(),
-                        objects.len()
+                        objects.len(),
+                        trend_logs.len(),
                     );
 
                     all_devices.push(BacnetDevice {
@@ -701,6 +722,7 @@ impl BacnetBridge {
                         model: walk_result.device_info.model_name,
                         firmware_revision: walk_result.device_info.firmware_revision,
                         objects,
+                        trend_logs,
                     });
                 }
                 Err(e) => {
@@ -766,7 +788,7 @@ impl BacnetBridge {
         self.time_sync_handle = Some(ts_handle);
 
         // 7. Start event notification polling (for intrinsic reporting)
-        let ev_tc = tc;
+        let ev_tc = tc.clone();
         let ev_devices = self.devices.clone();
         let ev_event_bus = self.event_bus.clone();
         let ev_store = store.clone();
@@ -774,6 +796,20 @@ impl BacnetBridge {
             run_event_poll_loop(ev_tc, ev_store, &ev_devices, ev_event_bus).await;
         });
         self.event_poll_handle = Some(ev_handle);
+
+        // 8. Start periodic TrendLog sync (if any devices have TrendLog objects)
+        let has_trend_logs = self.devices.iter().any(|d| !d.trend_logs.is_empty());
+        if has_trend_logs {
+            if let Some(history_store) = &self.history_store {
+                let tl_tc = tc;
+                let tl_devices = self.devices.clone();
+                let tl_history = history_store.clone();
+                let tl_handle = tokio::spawn(async move {
+                    run_trend_log_sync_loop(tl_tc, &tl_devices, tl_history).await;
+                });
+                self.trend_log_handle = Some(tl_handle);
+            }
+        }
 
         Ok(())
     }
@@ -1273,6 +1309,123 @@ fn handle_event_notification(
         notification.to_state_raw,
         notification.message_text
     );
+}
+
+// ---------------------------------------------------------------------------
+// Periodic TrendLog synchronization
+// ---------------------------------------------------------------------------
+
+/// How often to poll TrendLog objects for new records.
+const TREND_LOG_SYNC_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+/// Periodically reads new TrendLog records from all devices and inserts into HistoryStore.
+/// Tracks the last-read record count per TrendLog to only fetch incremental records.
+async fn run_trend_log_sync_loop(
+    tc: TransportClient,
+    devices: &[BacnetDevice],
+    history_store: HistoryStore,
+) {
+    // Wait for startup to settle
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    // Track last-known record count per (device_instance, trendlog_instance)
+    let mut last_counts: HashMap<(u32, u32), u32> = HashMap::new();
+
+    loop {
+        for dev in devices {
+            let dev_instance = dev.device_id.instance();
+            let dev_key = format!("bacnet-{dev_instance}");
+
+            for tl in &dev.trend_logs {
+                let tl_instance = tl.object_id.instance();
+                let tl_key = (dev_instance, tl_instance);
+
+                // Read current record count
+                let current_count = match with_client!(&tc, |c| c
+                    .read_property(
+                        dev.address,
+                        tl.object_id,
+                        PropertyId::RecordCount,
+                    )
+                    .await)
+                {
+                    Ok(ClientDataValue::Unsigned(n)) => n,
+                    _ => continue,
+                };
+
+                let last_count = last_counts.get(&tl_key).copied().unwrap_or(0);
+
+                if current_count <= last_count {
+                    // No new records
+                    last_counts.insert(tl_key, current_count);
+                    continue;
+                }
+
+                // Read only the new records
+                let new_start = (last_count + 1) as i32;
+                let fallback_name = format!("TrendLog-{tl_instance}");
+                let point_id = tl
+                    .object_name
+                    .as_deref()
+                    .unwrap_or(&fallback_name);
+                let point_key = format!("{dev_key}:{point_id}");
+
+                // Read in batches of 100
+                let batch_size: i16 = 100;
+                let mut index = new_start;
+                let mut total = 0usize;
+
+                while index <= current_count as i32 {
+                    let remaining = current_count as i32 - index + 1;
+                    let count = batch_size.min(remaining as i16);
+
+                    let items = match with_client!(&tc, |c| c
+                        .read_range_by_position(
+                            dev.address,
+                            tl.object_id,
+                            PropertyId::LogBuffer,
+                            None,
+                            index,
+                            count,
+                        )
+                        .await)
+                    {
+                        Ok(result) => result.items,
+                        Err(e) => {
+                            eprintln!(
+                                "BACnet: TrendLog sync failed for {dev_key}/TrendLog-{tl_instance}: {e}"
+                            );
+                            break;
+                        }
+                    };
+
+                    if items.is_empty() {
+                        break;
+                    }
+
+                    let samples = trend_log_items_to_samples(&items);
+                    let batch: Vec<(String, i64, f64)> = samples
+                        .iter()
+                        .map(|(ts, v)| (point_key.clone(), *ts, *v))
+                        .collect();
+                    total += batch.len();
+                    history_store.backfill(batch).await;
+
+                    index += count as i32;
+                }
+
+                if total > 0 {
+                    println!(
+                        "BACnet: synced {total} new TrendLog records for {dev_key}/{point_id}"
+                    );
+                }
+
+                last_counts.insert(tl_key, current_count);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(TREND_LOG_SYNC_INTERVAL_SECS)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

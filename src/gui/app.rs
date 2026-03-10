@@ -145,6 +145,7 @@ pub fn App() -> Element {
     let modbus_for_start = modbus_bridge.clone();
     let bacnet_config = bacnet_config_from_scenario(&loaded.config.settings);
     let bridge_event_bus = event_bus.clone();
+    let bridge_history = history_store.clone();
     use_hook(move || {
         spawn(async move {
             let mut rx = watcher_store.subscribe();
@@ -158,7 +159,8 @@ pub fn App() -> Element {
         spawn(async move {
             let mut bacnet = BacnetBridge::new()
                 .with_bacnet_config(bacnet_config)
-                .with_event_bus(bridge_event_bus);
+                .with_event_bus(bridge_event_bus)
+                .with_history_store(bridge_history);
             if let Err(e) = bacnet.start(bridge_store.clone()).await {
                 eprintln!("BACnet bridge error: {e}");
             }
