@@ -1258,7 +1258,7 @@ pub fn start_alarm_engine(store: &PointStore, _loaded: &LoadedScenario) -> Alarm
     start_alarm_engine_with_path(store, &db_dir.join("alarms.db"))
 }
 
-fn start_alarm_engine_with_path(store: &PointStore, db_path: &Path) -> AlarmStore {
+pub fn start_alarm_engine_with_path(store: &PointStore, db_path: &Path) -> AlarmStore {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (config_version_tx, config_version_rx) = watch::channel(0u64);
 

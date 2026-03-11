@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::discovery::model::{
-    ConnStatus, DeviceState, DiscoveredDevice, DiscoveredPoint, DiscoveryProtocol, PointKindHint,
+    ConnStatus, DeviceState, DiscoveredDevice, DiscoveredPoint, PointKindHint, PROTOCOL_BACNET,
 };
 use crate::event::bus::{Event, EventBus};
 
@@ -418,7 +418,7 @@ fn upsert_device_db(
              protocol_meta = excluded.protocol_meta",
         rusqlite::params![
             device.id,
-            device.protocol.as_str(),
+            &device.protocol,
             device.state.as_str(),
             device.conn_status.as_str(),
             device.display_name,
@@ -528,7 +528,7 @@ fn row_to_device(row: &rusqlite::Row) -> DiscoveredDevice {
 
     DiscoveredDevice {
         id: row.get(0).unwrap_or_default(),
-        protocol: DiscoveryProtocol::from_str(&protocol_str).unwrap_or(DiscoveryProtocol::Bacnet),
+        protocol: if protocol_str.is_empty() { PROTOCOL_BACNET.into() } else { protocol_str },
         state: DeviceState::from_str(&state_str).unwrap_or(DeviceState::Discovered),
         conn_status: ConnStatus::from_str(&conn_str).unwrap_or(ConnStatus::Unknown),
         display_name: row.get(4).unwrap_or_default(),
@@ -566,7 +566,7 @@ fn get_points_db(conn: &rusqlite::Connection, device_id: &str) -> Vec<Discovered
                 .unwrap_or(PointKindHint::Analog),
             writable: writable_int != 0,
             binding: serde_json::from_str(&binding_str)
-                .unwrap_or(crate::node::ProtocolBinding::Virtual),
+                .unwrap_or_else(|_| crate::node::ProtocolBinding::virtual_binding()),
             protocol_meta: serde_json::from_str(&meta_str)
                 .unwrap_or(serde_json::Value::Object(Default::default())),
         })
@@ -658,7 +658,7 @@ mod tests {
     fn sample_device(id: &str) -> DiscoveredDevice {
         DiscoveredDevice {
             id: id.to_string(),
-            protocol: DiscoveryProtocol::Bacnet,
+            protocol: PROTOCOL_BACNET.into(),
             state: DeviceState::Discovered,
             conn_status: ConnStatus::Online,
             display_name: format!("BACnet Device {id}"),
@@ -682,11 +682,7 @@ mod tests {
                 units: Some("°F".into()),
                 point_kind: PointKindHint::Analog,
                 writable: false,
-                binding: ProtocolBinding::Bacnet {
-                    device_instance: 1000,
-                    object_type: "AnalogInput".into(),
-                    object_instance: 1,
-                },
+                binding: ProtocolBinding::bacnet(1000, "AnalogInput", 1),
                 protocol_meta: serde_json::json!({}),
             },
             DiscoveredPoint {
@@ -697,11 +693,7 @@ mod tests {
                 units: None,
                 point_kind: PointKindHint::Binary,
                 writable: true,
-                binding: ProtocolBinding::Bacnet {
-                    device_instance: 1000,
-                    object_type: "BinaryOutput".into(),
-                    object_instance: 2,
-                },
+                binding: ProtocolBinding::bacnet(1000, "BinaryOutput", 2),
                 protocol_meta: serde_json::json!({}),
             },
         ]
@@ -716,7 +708,7 @@ mod tests {
 
         let fetched = store.get_device("bacnet-1000").await.unwrap();
         assert_eq!(fetched.id, "bacnet-1000");
-        assert_eq!(fetched.protocol, DiscoveryProtocol::Bacnet);
+        assert_eq!(fetched.protocol, PROTOCOL_BACNET);
         assert_eq!(fetched.state, DeviceState::Discovered);
         assert_eq!(fetched.conn_status, ConnStatus::Online);
 

@@ -32,7 +32,7 @@ pub enum NodeError {
 // Persistent representation (what goes to/from SQLite)
 // ----------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeRecord {
     pub id: NodeId,
     pub node_type: String,
@@ -1356,20 +1356,13 @@ mod tests {
         let store = start_node_store_with_path(&path);
 
         let node = Node::new("ahu-1/dat", NodeType::Point, "DAT")
-            .with_binding(ProtocolBinding::Bacnet {
-                device_instance: 1000,
-                object_type: "analog-input".into(),
-                object_instance: 1,
-            });
+            .with_binding(ProtocolBinding::bacnet(1000, "analog-input", 1));
 
         store.create_node(node).await.unwrap();
 
         let rec = store.get_node("ahu-1/dat").await.unwrap();
-        match rec.binding {
-            Some(ProtocolBinding::Bacnet { device_instance, .. }) => {
-                assert_eq!(device_instance, 1000);
-            }
-            other => panic!("expected BACnet binding, got {:?}", other),
-        }
+        let binding = rec.binding.expect("expected binding");
+        assert!(binding.is_bacnet());
+        assert_eq!(binding.config["device_instance"], 1000);
     }
 }

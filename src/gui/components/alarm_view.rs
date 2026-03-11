@@ -2,11 +2,12 @@ use std::collections::HashSet;
 
 use dioxus::prelude::*;
 
+use crate::auth::Permission;
 use crate::config::profile::PointKind;
 use crate::gui::state::AppState;
 use crate::store::alarm_store::{
     ActiveAlarm, AlarmConfig, AlarmEvent, AlarmHistoryQuery,
-    AlarmParams, AlarmSeverity, AlarmState,
+    AlarmParams, AlarmSeverity, AlarmState, AlarmType,
 };
 
 // ----------------------------------------------------------------
@@ -539,7 +540,12 @@ fn ActiveAlarmsTab() -> Element {
 #[component]
 fn AckAllButton() -> Element {
     let state = use_context::<AppState>();
+    let can_ack = state.has_permission(Permission::AcknowledgeAlarms);
     let mut ack_result = use_signal(|| Option::<String>::None);
+
+    if !can_ack {
+        return rsx! {};
+    }
 
     rsx! {
         button {
@@ -564,6 +570,7 @@ fn AckAllButton() -> Element {
 #[component]
 fn ActiveAlarmRow(alarm: ActiveAlarm) -> Element {
     let state = use_context::<AppState>();
+    let can_ack = state.has_permission(Permission::AcknowledgeAlarms);
     let sev_class = severity_class(alarm.severity);
     let time_str = format_time_ms(alarm.trigger_time_ms);
     let state_str = alarm.state.as_str();
@@ -582,13 +589,47 @@ fn ActiveAlarmRow(alarm: ActiveAlarm) -> Element {
             td { "{time_str}" }
             td { "{state_str}" }
             td {
-                if is_offnormal {
+                if is_offnormal && can_ack {
                     button {
                         class: "alarm-ack-btn",
                         onclick: move |_| {
                             let store = state.alarm_store.clone();
+                            let bridge = state.bacnet_bridge.clone();
+                            let dev_id = alarm.device_id.clone();
+                            let point_id = alarm.point_id.clone();
+                            let alarm_type = alarm.alarm_type.clone();
                             spawn(async move {
                                 let _ = store.acknowledge(config_id).await;
+                                // Also acknowledge on the remote BACnet device
+                                if let Some(instance) = dev_id.strip_prefix("bacnet-").and_then(|s| s.parse::<u32>().ok()) {
+                                    // Parse point_id to extract BACnet ObjectId.
+                                    // Point IDs are formatted as "{ObjectType}-{instance}" where
+                                    // ObjectType is kebab-case (e.g. "analog-input-1"). Find the
+                                    // last '-' that separates type name from numeric instance.
+                                    let object_id = parse_bacnet_object_id(&point_id);
+                                    if let Some(obj_id) = object_id {
+                                        // Map our AlarmType to the BACnet EventState
+                                        let event_state = alarm_type_to_event_state(&alarm_type);
+                                        let guard = bridge.lock().await;
+                                        if let Some(ref b) = *guard {
+                                            // TimeStamp::SequenceNumber(0) is used as a fallback
+                                            // because we don't persist the original event timestamp
+                                            // from the BACnet notification. Per BACnet spec, devices
+                                            // should accept this for acknowledgement.
+                                            if let Err(e) = b.acknowledge_alarm(
+                                                instance,
+                                                obj_id,
+                                                event_state,
+                                                rustbac_client::TimeStamp::SequenceNumber(0),
+                                                "operator",
+                                            ).await {
+                                                eprintln!("BACnet alarm ack failed: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("Could not parse BACnet object from point_id: {point_id}");
+                                    }
+                                }
                             });
                         },
                         "Ack"
@@ -596,6 +637,47 @@ fn ActiveAlarmRow(alarm: ActiveAlarm) -> Element {
                 }
             }
         }
+    }
+}
+
+// ----------------------------------------------------------------
+// BACnet alarm acknowledge helpers
+// ----------------------------------------------------------------
+
+/// Parse a point_id like "analog-input-1" into a BACnet ObjectId.
+///
+/// Point IDs are formatted as `"{ObjectType}-{instance}"` where ObjectType uses
+/// kebab-case display (e.g. "analog-input", "binary-value", "multi-state-input").
+/// We find the last '-' followed by only digits to split the type name from the
+/// instance number.
+fn parse_bacnet_object_id(point_id: &str) -> Option<rustbac_core::types::ObjectId> {
+    // Find the last '-' where everything after it is a valid u32
+    let mut split_pos = None;
+    for (i, ch) in point_id.char_indices().rev() {
+        if ch == '-' {
+            let suffix = &point_id[i + 1..];
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                split_pos = Some(i);
+                break;
+            }
+        }
+    }
+    let pos = split_pos?;
+    let type_name = &point_id[..pos];
+    let instance_str = &point_id[pos + 1..];
+    let obj_type = rustbac_core::types::ObjectType::from_name(type_name)?;
+    let instance = instance_str.parse::<u32>().ok()?;
+    Some(rustbac_core::types::ObjectId::new(obj_type, instance))
+}
+
+/// Map an OpenCrate AlarmType to the corresponding BACnet EventState.
+fn alarm_type_to_event_state(alarm_type: &AlarmType) -> rustbac_client::EventState {
+    match alarm_type {
+        AlarmType::HighLimit => rustbac_client::EventState::HighLimit,
+        AlarmType::LowLimit => rustbac_client::EventState::LowLimit,
+        AlarmType::StateFault => rustbac_client::EventState::Fault,
+        // All other alarm types map to Offnormal (the generic non-normal state)
+        _ => rustbac_client::EventState::Offnormal,
     }
 }
 

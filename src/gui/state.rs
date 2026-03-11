@@ -5,10 +5,12 @@ use dioxus::prelude::*;
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
 
 use crate::bridge::bacnet::BacnetBridge;
+use crate::bridge::modbus::ModbusBridge;
 use crate::config::loader::LoadedScenario;
 use crate::config::profile::PointValue;
 use crate::event::bus::EventBus;
 use crate::discovery::service::DiscoveryService;
+use crate::project::{ProjectMeta, ProjectPaths};
 use crate::store::alarm_store::AlarmStore;
 use crate::store::discovery_store::DiscoveryStore;
 use crate::store::entity_store::EntityStore;
@@ -16,6 +18,9 @@ use crate::store::history_store::HistoryStore;
 use crate::store::node_store::NodeStore;
 use crate::store::point_store::PointStore;
 use crate::store::schedule_store::ScheduleStore;
+use crate::auth::{AllRolePermissions, Permission};
+use crate::store::user_store::{User, UserStore};
+use crate::logic::store::ProgramStore;
 
 // ----------------------------------------------------------------
 // Floor plan / page canvas data model
@@ -377,6 +382,15 @@ pub enum SidebarTab {
     Nav,
 }
 
+/// What the file menu requested when closing a project.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CloseAction {
+    /// Return to launcher on the Recent tab.
+    ToRecent,
+    /// Return to launcher on the New Project tab.
+    ToNewProject,
+}
+
 /// What kind of content a nav node represents.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavNodeKind {
@@ -403,6 +417,8 @@ pub struct AppState {
     pub node_store: NodeStore,
     pub event_bus: EventBus,
     pub loaded: LoadedScenario,
+    pub project_meta: ProjectMeta,
+    pub project_paths: ProjectPaths,
     pub active_view: Signal<ActiveView>,
     pub sidebar_tab: Signal<SidebarTab>,
     pub selected_device: Signal<Option<String>>,
@@ -446,6 +462,16 @@ pub struct AppState {
     pub discovery_service: Arc<DiscoveryService>,
     /// BACnet bridge handle for discovery scans.
     pub bacnet_bridge: Arc<Mutex<Option<BacnetBridge>>>,
+    /// Modbus bridge handle for discovery scans.
+    pub modbus_bridge: Arc<Mutex<Option<ModbusBridge>>>,
+    /// Program store for logic engine.
+    pub program_store: ProgramStore,
+    /// Currently logged-in user.
+    pub current_user: Signal<Option<User>>,
+    /// User store for authentication and user management.
+    pub user_store: UserStore,
+    /// Per-role permission configuration.
+    pub role_permissions: Signal<AllRolePermissions>,
 }
 
 impl AppState {
@@ -478,6 +504,16 @@ impl AppState {
         let id = *self.next_node_id.read();
         self.next_node_id.set(id + 1);
         format!("node-{id}")
+    }
+
+    /// Check if the current user has a specific permission based on role permissions config.
+    pub fn has_permission(&self, perm: Permission) -> bool {
+        let user = self.current_user.read();
+        let perms = self.role_permissions.read();
+        match user.as_ref() {
+            Some(u) => crate::auth::has_permission(u, perm, &perms),
+            None => false,
+        }
     }
 }
 

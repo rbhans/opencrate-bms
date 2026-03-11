@@ -68,42 +68,54 @@ impl Default for ProfileNormalizer {
 
 impl Normalizer for ProfileNormalizer {
     fn normalize(&self, raw: &RawProtocolValue) -> Option<(NodeId, PointValue)> {
-        match raw {
-            RawProtocolValue::Bacnet {
-                device_instance,
-                object_type,
-                object_instance,
-                value,
-            } => {
-                let key = (*device_instance, object_type.clone(), *object_instance);
-                let node_id = self.bacnet_map.get(&key)?;
+        match raw.protocol.as_str() {
+            "bacnet" => self.normalize_bacnet(raw),
+            "modbus" => self.normalize_modbus(raw),
+            _ => None,
+        }
+    }
+}
 
-                // Convert serde_json::Value to PointValue
-                let pv = json_to_point_value(value)?;
-                Some((node_id.clone(), pv))
-            }
-            RawProtocolValue::Modbus {
-                host,
-                unit_id,
-                register,
-                raw_bytes,
-            } => {
-                let key = (host.clone(), *unit_id, *register);
-                let (node_id, scale) = self.modbus_map.get(&key)?;
+impl ProfileNormalizer {
+    fn normalize_bacnet(&self, raw: &RawProtocolValue) -> Option<(NodeId, PointValue)> {
+        let data = &raw.raw_data;
+        let device_instance = data.get("device_instance")?.as_u64()? as u32;
+        let object_type = data.get("object_type")?.as_str()?;
+        let object_instance = data.get("object_instance")?.as_u64()? as u32;
+        let value = data.get("value")?;
 
-                // Convert raw bytes to f64, then apply scale (register_value / scale)
-                if raw_bytes.len() >= 2 {
-                    let raw_val = u16::from_be_bytes([raw_bytes[0], raw_bytes[1]]) as f64;
-                    let scaled = if *scale != 0.0 {
-                        raw_val / scale
-                    } else {
-                        raw_val
-                    };
-                    Some((node_id.clone(), PointValue::Float(scaled)))
-                } else {
-                    None
-                }
-            }
+        let key = (device_instance, object_type.to_string(), object_instance);
+        let node_id = self.bacnet_map.get(&key)?;
+        let pv = json_to_point_value(value)?;
+        Some((node_id.clone(), pv))
+    }
+
+    fn normalize_modbus(&self, raw: &RawProtocolValue) -> Option<(NodeId, PointValue)> {
+        let data = &raw.raw_data;
+        let host = data.get("host")?.as_str()?;
+        let unit_id = data.get("unit_id")?.as_u64()? as u8;
+        let register = data.get("register")?.as_u64()? as u16;
+
+        let key = (host.to_string(), unit_id, register);
+        let (node_id, scale) = self.modbus_map.get(&key)?;
+
+        // Raw bytes as JSON array
+        let raw_bytes: Vec<u8> = data
+            .get("raw_bytes")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
+            .unwrap_or_default();
+
+        if raw_bytes.len() >= 2 {
+            let raw_val = u16::from_be_bytes([raw_bytes[0], raw_bytes[1]]) as f64;
+            let scaled = if *scale != 0.0 {
+                raw_val / scale
+            } else {
+                raw_val
+            };
+            Some((node_id.clone(), PointValue::Float(scaled)))
+        } else {
+            None
         }
     }
 }
@@ -212,11 +224,16 @@ mod tests {
         let mut norm = ProfileNormalizer::new();
         norm.add_bacnet_mapping(1000, "analog-input", 1, "ahu-1/dat");
 
-        let raw = RawProtocolValue::Bacnet {
-            device_instance: 1000,
-            object_type: "analog-input".into(),
-            object_instance: 1,
-            value: serde_json::json!(72.5),
+        let raw = RawProtocolValue {
+            protocol: "bacnet".into(),
+            device_key: "1000".into(),
+            point_key: "analog-input-1".into(),
+            raw_data: serde_json::json!({
+                "device_instance": 1000,
+                "object_type": "analog-input",
+                "object_instance": 1,
+                "value": 72.5,
+            }),
         };
 
         let result = norm.normalize(&raw);
@@ -231,11 +248,16 @@ mod tests {
         let mut norm = ProfileNormalizer::new();
         norm.add_modbus_mapping("192.168.1.100", 1, 100, "ahu-1/oat", 10.0);
 
-        let raw = RawProtocolValue::Modbus {
-            host: "192.168.1.100".into(),
-            unit_id: 1,
-            register: 100,
-            raw_bytes: vec![0x03, 0x20], // 800 → 800/10 = 80.0
+        let raw = RawProtocolValue {
+            protocol: "modbus".into(),
+            device_key: "192.168.1.100:1".into(),
+            point_key: "100".into(),
+            raw_data: serde_json::json!({
+                "host": "192.168.1.100",
+                "unit_id": 1,
+                "register": 100,
+                "raw_bytes": [0x03, 0x20],
+            }),
         };
 
         let result = norm.normalize(&raw);
@@ -248,11 +270,28 @@ mod tests {
     #[test]
     fn unmapped_value_returns_none() {
         let norm = ProfileNormalizer::new();
-        let raw = RawProtocolValue::Bacnet {
-            device_instance: 999,
-            object_type: "analog-input".into(),
-            object_instance: 1,
-            value: serde_json::json!(42),
+        let raw = RawProtocolValue {
+            protocol: "bacnet".into(),
+            device_key: "999".into(),
+            point_key: "analog-input-1".into(),
+            raw_data: serde_json::json!({
+                "device_instance": 999,
+                "object_type": "analog-input",
+                "object_instance": 1,
+                "value": 42,
+            }),
+        };
+        assert!(norm.normalize(&raw).is_none());
+    }
+
+    #[test]
+    fn unknown_protocol_returns_none() {
+        let norm = ProfileNormalizer::new();
+        let raw = RawProtocolValue {
+            protocol: "knx".into(),
+            device_key: "1.2.3".into(),
+            point_key: "switch-1".into(),
+            raw_data: serde_json::json!({"value": true}),
         };
         assert!(norm.normalize(&raw).is_none());
     }

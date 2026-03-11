@@ -8,7 +8,12 @@ use crate::haystack::prototypes::{EQUIP_PROTOTYPES, POINT_PROTOTYPES};
 use crate::haystack::tags::{self, TagKind};
 use crate::store::entity_store::Entity;
 
+use crate::auth::Permission;
+
 use super::discovery_view::DiscoveryView;
+use super::programming_view::ProgrammingView;
+use super::user_management::UserManagementView;
+use super::virtual_points_view::VirtualPointsView;
 
 // ----------------------------------------------------------------
 // Config sub-tabs
@@ -19,6 +24,8 @@ pub enum ConfigSection {
     Haystack,
     Discovery,
     Programming,
+    VirtualPoints,
+    Users,
 }
 
 impl ConfigSection {
@@ -27,11 +34,23 @@ impl ConfigSection {
             Self::Haystack => "Haystack",
             Self::Discovery => "Discovery",
             Self::Programming => "Programming",
+            Self::VirtualPoints => "Virtual Points",
+            Self::Users => "Users",
         }
     }
 
-    pub fn all() -> &'static [ConfigSection] {
-        &[Self::Haystack, Self::Discovery, Self::Programming]
+    /// Returns sections visible to the current user.
+    pub fn visible_sections(is_admin: bool) -> Vec<ConfigSection> {
+        let mut sections = vec![
+            Self::Haystack,
+            Self::Discovery,
+            Self::Programming,
+            Self::VirtualPoints,
+        ];
+        if is_admin {
+            sections.push(Self::Users);
+        }
+        sections
     }
 }
 
@@ -41,6 +60,10 @@ impl ConfigSection {
 
 #[component]
 pub fn ConfigView() -> Element {
+    let state = use_context::<AppState>();
+    let can_manage_users = state.has_permission(Permission::ManageUsers);
+    let sections = ConfigSection::visible_sections(can_manage_users);
+
     let mut section = use_signal(|| ConfigSection::Haystack);
     let current = *section.read();
 
@@ -48,14 +71,14 @@ pub fn ConfigView() -> Element {
         div { class: "config-view",
             // Sub-tab bar
             div { class: "config-section-bar",
-                for s in ConfigSection::all() {
+                for s in &sections {
                     {
                         let s_val = *s;
                         rsx! {
                             button {
                                 class: if current == s_val { "config-section-btn active" } else { "config-section-btn" },
                                 onclick: move |_| section.set(s_val),
-                                "{s.label()}"
+                                "{s_val.label()}"
                             }
                         }
                     }
@@ -67,12 +90,9 @@ pub fn ConfigView() -> Element {
                 match current {
                     ConfigSection::Haystack => rsx! { HaystackView {} },
                     ConfigSection::Discovery => rsx! { DiscoveryView {} },
-                    ConfigSection::Programming => rsx! {
-                        div { class: "config-placeholder",
-                            h3 { "Programming" }
-                            p { "Program blocks will be available in a future update." }
-                        }
-                    },
+                    ConfigSection::Programming => rsx! { ProgrammingView {} },
+                    ConfigSection::VirtualPoints => rsx! { VirtualPointsView {} },
+                    ConfigSection::Users => rsx! { UserManagementView {} },
                 }
             }
         }

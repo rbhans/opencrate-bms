@@ -89,11 +89,11 @@ fn build_binding(
                 .and_then(|b| b.device_id)
                 .unwrap_or(0);
 
-            return Some(ProtocolBinding::Bacnet {
+            return Some(ProtocolBinding::bacnet(
                 device_instance,
-                object_type: format!("{:?}", bacnet.object_type).to_lowercase().replace('_', "-"),
-                object_instance: bacnet.instance,
-            });
+                &format!("{:?}", bacnet.object_type).to_lowercase().replace('_', "-"),
+                bacnet.instance,
+            ));
         }
 
         if let Some(ref modbus) = protocols.modbus {
@@ -104,18 +104,18 @@ fn build_binding(
                 .and_then(|d| d.protocols.as_ref())
                 .and_then(|p| p.modbus.as_ref());
 
-            return Some(ProtocolBinding::Modbus {
-                host: defaults.and_then(|d| d.host.clone()).unwrap_or_default(),
-                port: defaults.and_then(|d| d.port).unwrap_or(502),
-                unit_id: defaults.and_then(|d| d.unit_id).unwrap_or(1),
-                register: modbus.address,
-                data_type: modbus
+            return Some(ProtocolBinding::modbus(
+                &defaults.and_then(|d| d.host.clone()).unwrap_or_default(),
+                defaults.and_then(|d| d.port).unwrap_or(502),
+                defaults.and_then(|d| d.unit_id).unwrap_or(1),
+                modbus.address,
+                &modbus
                     .data_type
                     .as_ref()
                     .map(|dt| format!("{:?}", dt).to_lowercase())
                     .unwrap_or_else(|| "uint16".into()),
-                scale: modbus.scale.unwrap_or(1.0),
-            });
+                modbus.scale.unwrap_or(1.0),
+            ));
         }
     }
     None

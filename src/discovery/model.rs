@@ -2,30 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::ProtocolBinding;
 
-/// Which protocol discovered this device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscoveryProtocol {
-    Bacnet,
-    Modbus,
-}
-
-impl DiscoveryProtocol {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Bacnet => "bacnet",
-            Self::Modbus => "modbus",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "bacnet" => Some(Self::Bacnet),
-            "modbus" => Some(Self::Modbus),
-            _ => None,
-        }
-    }
-}
+/// Well-known protocol identifiers (constants for convenience).
+pub const PROTOCOL_BACNET: &str = "bacnet";
+pub const PROTOCOL_MODBUS: &str = "modbus";
 
 /// Device approval state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +94,8 @@ impl PointKindHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
     pub id: String,
-    pub protocol: DiscoveryProtocol,
+    /// Protocol identifier string (e.g. "bacnet", "modbus", "knx")
+    pub protocol: String,
     pub state: DeviceState,
     pub conn_status: ConnStatus,
     pub display_name: String,
@@ -145,14 +125,6 @@ pub struct DiscoveredPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_roundtrip() {
-        for p in &[DiscoveryProtocol::Bacnet, DiscoveryProtocol::Modbus] {
-            let s = p.as_str();
-            assert_eq!(DiscoveryProtocol::from_str(s), Some(*p));
-        }
-    }
 
     #[test]
     fn state_roundtrip() {

@@ -1,17 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddrV4;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustbac_bacnet_sc::BacnetScTransport;
 use rustbac_client::{
     schedule::{self, CalendarEntry, TimeValue},
     walk::walk_device,
-    BacnetClient, ClientDataValue, CovManagerBuilder, CovSubscriptionSpec, EventNotification,
-    ReadRangeResult,
+    AlarmSummaryItem, AtomicReadFileResult, AtomicWriteFileResult, BacnetClient,
+    BroadcastDistributionEntry, ClientDataValue, CovManagerBuilder, CovSubscriptionSpec,
+    DiscoveredObject, EnrollmentSummaryItem, EventNotification, EventState,
+    ForeignDeviceTableEntry, ObjectStore, ObjectStoreHandler, ReadRangeResult, TimeStamp,
 };
+use rustbac_core::services::acknowledge_alarm::AcknowledgeAlarmRequest;
 use rustbac_core::services::device_management::{DeviceCommunicationState, ReinitializeState};
+use rustbac_core::services::subscribe_cov_property::SubscribeCovPropertyRequest;
 use rustbac_core::types::{ObjectId, ObjectType, PropertyId};
 use rustbac_datalink::{BacnetIpTransport, DataLink};
+use rustbac_mstp::{MstpConfig, MstpTransport};
 use tokio::task::JoinHandle;
 
 use crate::config::profile::PointValue;
@@ -56,6 +62,13 @@ pub fn bacnet_config_from_scenario(settings: &Option<ScenarioSettings>) -> Bacne
                 .unwrap_or_default();
             BacnetMode::SecureConnect { hub_endpoint: hub }
         }
+        "mstp" => {
+            let port = bacnet_net.serial_port.clone().unwrap_or_default();
+            let baud = bacnet_net.baud_rate.unwrap_or(38400);
+            let mac = bacnet_net.mac_address.unwrap_or(0);
+            let max_master = bacnet_net.max_master.unwrap_or(127);
+            BacnetMode::Mstp { port, baud_rate: baud, mac_address: mac, max_master }
+        }
         _ => BacnetMode::Normal,
     };
 
@@ -79,6 +92,13 @@ pub enum BacnetMode {
     /// BACnet Secure Connect — tunnel over WebSocket to a BACnet/SC hub.
     SecureConnect {
         hub_endpoint: String,
+    },
+    /// MS/TP over RS-485 serial port.
+    Mstp {
+        port: String,
+        baud_rate: u32,
+        mac_address: u8,
+        max_master: u8,
     },
 }
 
@@ -140,6 +160,7 @@ pub struct BacnetObject {
 enum TransportClient {
     Ip(Arc<BacnetClient<BacnetIpTransport>>),
     Sc(Arc<BacnetClient<BacnetScTransport>>),
+    Mstp(Arc<BacnetClient<MstpTransport>>),
 }
 
 /// Helper macro to dispatch a method call on TransportClient to the inner Arc.
@@ -148,6 +169,7 @@ macro_rules! with_client {
         match $self {
             TransportClient::Ip($c) => $body,
             TransportClient::Sc($c) => $body,
+            TransportClient::Mstp($c) => $body,
         }
     };
 }
@@ -173,6 +195,12 @@ pub struct BacnetBridge {
     time_sync_handle: Option<JoinHandle<()>>,
     event_poll_handle: Option<JoinHandle<()>>,
     trend_log_handle: Option<JoinHandle<()>>,
+    /// Object store for the optional BACnet server (exposes local points to the network).
+    server_object_store: Option<Arc<ObjectStore>>,
+    /// Device instance number for the BACnet server (if configured).
+    server_device_instance: Option<u32>,
+    /// Device instances seen in the most recent rescan (Who-Is responses).
+    last_scan_instances: HashSet<u32>,
 }
 
 impl Default for BacnetBridge {
@@ -199,6 +227,9 @@ impl BacnetBridge {
             time_sync_handle: None,
             event_poll_handle: None,
             trend_log_handle: None,
+            server_object_store: None,
+            server_device_instance: None,
+            last_scan_instances: HashSet::new(),
         }
     }
 
@@ -229,6 +260,326 @@ impl BacnetBridge {
 
     pub fn discovered_devices(&self) -> &[BacnetDevice] {
         &self.devices
+    }
+
+    /// Returns the set of device instances that responded to Who-Is in the most recent rescan.
+    pub fn last_scan_instances(&self) -> &HashSet<u32> {
+        &self.last_scan_instances
+    }
+
+    /// Re-scan the BACnet network: run a fresh Who-Is broadcast, walk any new
+    /// devices, merge them into the existing device list, populate PointStore
+    /// for new devices, and restart the background loops (COV/poll, time sync,
+    /// event poll, trend log sync) so they pick up the updated device set.
+    ///
+    /// Returns the list of *newly* discovered devices (devices that weren't
+    /// already in `self.devices`).
+    pub async fn rescan(&mut self, store: PointStore) -> Result<Vec<BacnetDevice>, BridgeError> {
+        let tc = self.require_transport()?.clone();
+        let discovery_timeout = self.discovery_timeout;
+
+        println!(
+            "BACnet rescan: sending Who-Is broadcast (waiting {}s)...",
+            discovery_timeout.as_secs()
+        );
+        let discovered = match with_client!(&tc, |c| c.who_is(None, discovery_timeout).await) {
+            Ok(devs) => devs,
+            Err(e) => {
+                println!("BACnet rescan: discovery failed ({e})");
+                return Err(BridgeError::ConnectionFailed(format!("Who-Is failed: {e}")));
+            }
+        };
+
+        if discovered.is_empty() {
+            println!("BACnet rescan: no devices discovered.");
+            self.last_scan_instances = HashSet::new();
+            return Ok(vec![]);
+        }
+
+        // Record which instances responded to Who-Is (used by DiscoveryService
+        // to only mark these devices Online, not stale cached ones).
+        self.last_scan_instances = discovered
+            .iter()
+            .filter_map(|d| d.device_id.map(|id| id.instance()))
+            .collect();
+
+        println!("BACnet rescan: discovered {} device(s)", discovered.len());
+
+        // Walk each device and collect results
+        let mut scanned_devices = Vec::new();
+        for dev in &discovered {
+            let device_id = match dev.device_id {
+                Some(id) => id,
+                None => continue,
+            };
+
+            match with_client!(&tc, |c| walk_device(c, dev.address, device_id).await) {
+                Ok(walk_result) => {
+                    let mut objects = Vec::new();
+                    let mut trend_logs = Vec::new();
+
+                    for o in walk_result.objects {
+                        if o.object_id.object_type() == ObjectType::TrendLog {
+                            trend_logs.push(TrendLogRef {
+                                object_id: o.object_id,
+                                object_name: o.object_name,
+                            });
+                        } else if is_point_object(o.object_id.object_type()) {
+                            let classification =
+                                rustbac_client::point::classify_point(o.object_id.object_type());
+                            objects.push(BacnetObject {
+                                object_id: o.object_id,
+                                object_name: o.object_name,
+                                description: o.description,
+                                units: o.units,
+                                present_value: o.present_value,
+                                writable: classification.writable,
+                            });
+                        }
+                    }
+
+                    scanned_devices.push(BacnetDevice {
+                        device_id,
+                        address: dev.address,
+                        vendor: walk_result.device_info.vendor_name,
+                        model: walk_result.device_info.model_name,
+                        firmware_revision: walk_result.device_info.firmware_revision,
+                        objects,
+                        trend_logs,
+                    });
+                }
+                Err(e) => {
+                    println!(
+                        "  device {} — walk failed: {e}",
+                        device_id.instance()
+                    );
+                }
+            }
+        }
+
+        // Merge: keep existing, add new, update objects for re-walked devices
+        let existing_instances: std::collections::HashSet<u32> = self
+            .devices
+            .iter()
+            .map(|d| d.device_id.instance())
+            .collect();
+
+        let mut new_devices = Vec::new();
+        for dev in scanned_devices {
+            let inst = dev.device_id.instance();
+            if existing_instances.contains(&inst) {
+                // Update existing device's objects and metadata in place.
+                // Clear stale points from PointStore first — the object list may have changed.
+                let device_key = format!("bacnet-{inst}");
+                store.remove_device_points(&device_key);
+
+                if let Some(existing) = self.devices.iter_mut().find(|d| d.device_id.instance() == inst) {
+                    existing.objects = dev.objects;
+                    existing.trend_logs = dev.trend_logs;
+                    existing.address = dev.address;
+                    existing.vendor = dev.vendor;
+                    existing.model = dev.model;
+                    existing.firmware_revision = dev.firmware_revision;
+
+                    // Repopulate PointStore with current object set
+                    for obj in &existing.objects {
+                        let point_id = object_point_id(obj);
+                        let key = PointKey {
+                            device_instance_id: device_key.clone(),
+                            point_id: point_id.clone(),
+                        };
+                        if let Some(pv) = &obj.present_value {
+                            store.set(key, client_to_point_value(pv, obj.object_id.object_type()));
+                        }
+                    }
+                }
+            } else {
+                new_devices.push(dev);
+            }
+        }
+
+        // Add new devices and populate PointStore + point_map for them
+        for dev in &new_devices {
+            let dev_instance = dev.device_id.instance();
+            let device_key = format!("bacnet-{dev_instance}");
+
+            for obj in &dev.objects {
+                let point_id = object_point_id(obj);
+                let key = PointKey {
+                    device_instance_id: device_key.clone(),
+                    point_id: point_id.clone(),
+                };
+
+                if let Some(pv) = &obj.present_value {
+                    store.set(key, client_to_point_value(pv, obj.object_id.object_type()));
+                }
+
+                self.point_map
+                    .insert((dev_instance, obj.object_id.instance()), obj.object_id);
+            }
+
+            println!(
+                "BACnet rescan: new device {} — {} point(s)",
+                dev_instance,
+                dev.objects.len()
+            );
+        }
+
+        self.devices.extend(new_devices.clone());
+
+        // Also refresh point_map for existing (re-walked) devices
+        for dev in &self.devices {
+            let dev_instance = dev.device_id.instance();
+            for obj in &dev.objects {
+                self.point_map
+                    .insert((dev_instance, obj.object_id.instance()), obj.object_id);
+            }
+        }
+
+        // Restart all background loops with the updated device set
+        self.restart_background_loops(tc, store)?;
+
+        let total_points: usize = self.devices.iter().map(|d| d.objects.len()).sum();
+        println!(
+            "BACnet rescan: now monitoring {} device(s), {} point(s)",
+            self.devices.len(),
+            total_points,
+        );
+
+        Ok(new_devices)
+    }
+
+    /// Abort existing background tasks and restart them with the current device set.
+    fn restart_background_loops(
+        &mut self,
+        tc: TransportClient,
+        store: PointStore,
+    ) -> Result<(), BridgeError> {
+        // Abort existing handles
+        for handle in [
+            self.cov_handle.take(),
+            self.poll_handle.take(),
+            self.time_sync_handle.take(),
+            self.event_poll_handle.take(),
+            self.trend_log_handle.take(),
+        ] {
+            if let Some(h) = handle {
+                h.abort();
+            }
+        }
+
+        // Restart COV + poll
+        let cov_tc = tc.clone();
+        let cov_store = store.clone();
+        let cov_devices = self.devices.clone();
+        let poll_interval = self.poll_interval;
+        let cov_lifetime = self.cov_lifetime;
+        let cov_event_bus = self.event_bus.clone();
+        let cov_handle = tokio::spawn(async move {
+            run_cov_with_poll_fallback(
+                cov_tc,
+                cov_store,
+                &cov_devices,
+                poll_interval,
+                cov_lifetime,
+                cov_event_bus,
+            )
+            .await;
+        });
+        self.cov_handle = Some(cov_handle);
+
+        // Restart time sync
+        let ts_tc = tc.clone();
+        let ts_devices = self.devices.clone();
+        let ts_handle = tokio::spawn(async move {
+            run_time_sync_loop(ts_tc, &ts_devices).await;
+        });
+        self.time_sync_handle = Some(ts_handle);
+
+        // Restart event poll
+        let ev_tc = tc.clone();
+        let ev_devices = self.devices.clone();
+        let ev_event_bus = self.event_bus.clone();
+        let ev_store = store.clone();
+        let ev_handle = tokio::spawn(async move {
+            run_event_poll_loop(ev_tc, ev_store, &ev_devices, ev_event_bus).await;
+        });
+        self.event_poll_handle = Some(ev_handle);
+
+        // Restart trend log sync if applicable
+        let has_trend_logs = self.devices.iter().any(|d| !d.trend_logs.is_empty());
+        if has_trend_logs {
+            if let Some(history_store) = &self.history_store {
+                let tl_tc = tc;
+                let tl_devices = self.devices.clone();
+                let tl_history = history_store.clone();
+                let tl_handle = tokio::spawn(async move {
+                    run_trend_log_sync_loop(tl_tc, &tl_devices, tl_history).await;
+                });
+                self.trend_log_handle = Some(tl_handle);
+            }
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // BACnet server (exposes local points as BACnet objects)
+    // -----------------------------------------------------------------------
+
+    /// Initialize the server object store and populate it with current point values.
+    ///
+    /// This creates the `ObjectStore` that represents local points as BACnet
+    /// objects. When the bridge starts, the server handler is attached inline
+    /// to the BACnet client so incoming requests are dispatched automatically.
+    pub fn init_server_store(
+        &mut self,
+        device_instance: u32,
+        store: &PointStore,
+    ) {
+        let object_store = Arc::new(ObjectStore::new());
+
+        // Populate the object store with current point values from PointStore.
+        // Each point is exposed as a BACnet analog-value object keyed by its
+        // position in the store.
+        let keys = store.all_keys();
+        let mut obj_index: u32 = 1; // start object instances at 1
+        for key in &keys {
+            if let Some(entry) = store.get(key) {
+                let object_id = ObjectId::new(ObjectType::AnalogValue, obj_index);
+                let cdv = match &entry.value {
+                    PointValue::Float(f) => ClientDataValue::Real(*f as f32),
+                    PointValue::Integer(i) => ClientDataValue::Real(*i as f32),
+                    PointValue::Bool(b) => ClientDataValue::Real(if *b { 1.0 } else { 0.0 }),
+                };
+                object_store.set(object_id, PropertyId::PresentValue, cdv);
+                // Also set ObjectName from the point key
+                object_store.set(
+                    object_id,
+                    PropertyId::ObjectName,
+                    ClientDataValue::CharacterString(format!("{}/{}", key.device_instance_id, key.point_id)),
+                );
+                obj_index += 1;
+            }
+        }
+
+        self.server_device_instance = Some(device_instance);
+        self.server_object_store = Some(object_store);
+
+        println!(
+            "BACnet: server object store initialized (device instance {device_instance}, {} objects)",
+            obj_index - 1
+        );
+    }
+
+    /// Get a reference to the server's object store for syncing point values.
+    pub fn server_object_store(&self) -> Option<&Arc<ObjectStore>> {
+        self.server_object_store.as_ref()
+    }
+
+    /// Get the configured server device instance number.
+    pub fn server_device_instance(&self) -> Option<u32> {
+        self.server_device_instance
     }
 
     // -----------------------------------------------------------------------
@@ -314,8 +665,67 @@ impl BacnetBridge {
             .map(|s| BacnetEventInfo {
                 object_id: s.object_id,
                 event_state: s.event_state_raw,
+                acknowledged_transitions: Some(s.acknowledged_transitions.data),
+                notify_type: Some(s.notify_type),
+                event_enable: Some(s.event_enable.data),
+                event_priorities: Some(s.event_priorities),
             })
             .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // BBMD management (BACnet/IP only)
+    // -----------------------------------------------------------------------
+
+    /// Require that the transport is BACnet/IP; return a reference to the inner
+    /// `BacnetClient<BacnetIpTransport>`.  Returns an error for SC and MS/TP
+    /// transports since BBMD operations are only defined for BACnet/IP.
+    fn require_ip_transport(&self) -> Result<&Arc<BacnetClient<BacnetIpTransport>>, BridgeError> {
+        match self.require_transport()? {
+            TransportClient::Ip(c) => Ok(c),
+            TransportClient::Sc(_) | TransportClient::Mstp(_) => Err(BridgeError::Protocol(
+                "BBMD operations are only supported on BACnet/IP transport".into(),
+            )),
+        }
+    }
+
+    /// Read the Broadcast Distribution Table from the BBMD.
+    pub async fn read_bdt(&self) -> Result<Vec<BroadcastDistributionEntry>, BridgeError> {
+        let client = self.require_ip_transport()?;
+        client
+            .read_broadcast_distribution_table()
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("ReadBroadcastDistributionTable failed: {e}")))
+    }
+
+    /// Write (replace) the Broadcast Distribution Table on the BBMD.
+    pub async fn write_bdt(
+        &self,
+        entries: &[BroadcastDistributionEntry],
+    ) -> Result<(), BridgeError> {
+        let client = self.require_ip_transport()?;
+        client
+            .write_broadcast_distribution_table(entries)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("WriteBroadcastDistributionTable failed: {e}")))
+    }
+
+    /// Read the Foreign Device Table from the BBMD.
+    pub async fn read_fdt(&self) -> Result<Vec<ForeignDeviceTableEntry>, BridgeError> {
+        let client = self.require_ip_transport()?;
+        client
+            .read_foreign_device_table()
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("ReadForeignDeviceTable failed: {e}")))
+    }
+
+    /// Delete a specific entry from the BBMD's Foreign Device Table.
+    pub async fn delete_fdt_entry(&self, address: SocketAddrV4) -> Result<(), BridgeError> {
+        let client = self.require_ip_transport()?;
+        client
+            .delete_foreign_device_table_entry(address)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("DeleteForeignDeviceTableEntry failed: {e}")))
     }
 
     // -----------------------------------------------------------------------
@@ -507,6 +917,320 @@ impl BacnetBridge {
             .map_err(|e| BridgeError::Protocol(format!("Read ExceptionSchedule: {e}"))))
     }
 
+    // -----------------------------------------------------------------------
+    // Alarm/Event services
+    // -----------------------------------------------------------------------
+
+    /// Acknowledge an alarm on a remote BACnet device.
+    pub async fn acknowledge_alarm(
+        &self,
+        device_instance: u32,
+        object_id: ObjectId,
+        event_state: EventState,
+        event_timestamp: TimeStamp,
+        source: &str,
+    ) -> Result<(), BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let (date, time) = now_bacnet_utc();
+        let request = AcknowledgeAlarmRequest {
+            acknowledging_process_id: 0,
+            event_object_id: object_id,
+            event_state_acknowledged: event_state,
+            event_time_stamp: event_timestamp,
+            acknowledgment_source: source,
+            time_of_acknowledgment: TimeStamp::DateTime { date, time },
+            invoke_id: 0, // will be overwritten by client
+        };
+        with_client!(tc, |c| c
+            .acknowledge_alarm(dev.address, request)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("AcknowledgeAlarm failed: {e}"))))?;
+        Ok(())
+    }
+
+    /// Get alarm summary from a remote BACnet device.
+    pub async fn get_alarm_summary(
+        &self,
+        device_instance: u32,
+    ) -> Result<Vec<AlarmSummaryItem>, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        with_client!(tc, |c| c
+            .get_alarm_summary(dev.address)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("GetAlarmSummary failed: {e}"))))
+    }
+
+    /// Get enrollment summary from a remote BACnet device.
+    pub async fn get_enrollment_summary(
+        &self,
+        device_instance: u32,
+    ) -> Result<Vec<EnrollmentSummaryItem>, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        with_client!(tc, |c| c
+            .get_enrollment_summary(dev.address)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("GetEnrollmentSummary failed: {e}"))))
+    }
+
+    // -----------------------------------------------------------------------
+    // Object management
+    // -----------------------------------------------------------------------
+
+    /// Create a new object on a remote BACnet device.
+    pub async fn create_object(
+        &self,
+        device_instance: u32,
+        object_type: ObjectType,
+    ) -> Result<ObjectId, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        with_client!(tc, |c| c
+            .create_object_by_type(dev.address, object_type)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("CreateObject failed: {e}"))))
+    }
+
+    /// Delete an object from a remote BACnet device.
+    pub async fn delete_object(
+        &self,
+        device_instance: u32,
+        object_id: ObjectId,
+    ) -> Result<(), BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        with_client!(tc, |c| c
+            .delete_object(dev.address, object_id)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("DeleteObject failed: {e}"))))
+    }
+
+    // -----------------------------------------------------------------------
+    // File operations
+    // -----------------------------------------------------------------------
+
+    /// Read bytes from a BACnet File object using stream access.
+    pub async fn read_file_stream(
+        &self,
+        device_instance: u32,
+        file_instance: u32,
+        start: i32,
+        count: u32,
+    ) -> Result<AtomicReadFileResult, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let file_id = ObjectId::new(ObjectType::File, file_instance);
+        with_client!(tc, |c| c
+            .atomic_read_file_stream(dev.address, file_id, start, count)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("AtomicReadFile(stream) failed: {e}"))))
+    }
+
+    /// Read records from a BACnet File object using record access.
+    pub async fn read_file_record(
+        &self,
+        device_instance: u32,
+        file_instance: u32,
+        start: i32,
+        count: u32,
+    ) -> Result<AtomicReadFileResult, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let file_id = ObjectId::new(ObjectType::File, file_instance);
+        with_client!(tc, |c| c
+            .atomic_read_file_record(dev.address, file_id, start, count)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("AtomicReadFile(record) failed: {e}"))))
+    }
+
+    /// Write bytes to a BACnet File object using stream access.
+    pub async fn write_file_stream(
+        &self,
+        device_instance: u32,
+        file_instance: u32,
+        start: i32,
+        data: &[u8],
+    ) -> Result<AtomicWriteFileResult, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let file_id = ObjectId::new(ObjectType::File, file_instance);
+        with_client!(tc, |c| c
+            .atomic_write_file_stream(dev.address, file_id, start, data)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("AtomicWriteFile(stream) failed: {e}"))))
+    }
+
+    /// Write records to a BACnet File object using record access.
+    pub async fn write_file_record(
+        &self,
+        device_instance: u32,
+        file_instance: u32,
+        start: i32,
+        records: &[&[u8]],
+    ) -> Result<AtomicWriteFileResult, BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let file_id = ObjectId::new(ObjectType::File, file_instance);
+        with_client!(tc, |c| c
+            .atomic_write_file_record(dev.address, file_id, start, records)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("AtomicWriteFile(record) failed: {e}"))))
+    }
+
+    // -----------------------------------------------------------------------
+    // Discovery (Who-Has)
+    // -----------------------------------------------------------------------
+
+    /// Broadcast Who-Has by ObjectId and collect I-Have responses.
+    pub async fn who_has_by_id(
+        &self,
+        object_id: ObjectId,
+        timeout: Duration,
+    ) -> Result<Vec<DiscoveredObject>, BridgeError> {
+        let tc = self.require_transport()?;
+        with_client!(tc, |c| c
+            .who_has_object_id(None, object_id, timeout)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("WhoHas(id) failed: {e}"))))
+    }
+
+    /// Broadcast Who-Has by object name and collect I-Have responses.
+    pub async fn who_has_by_name(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Vec<DiscoveredObject>, BridgeError> {
+        let tc = self.require_transport()?;
+        with_client!(tc, |c| c
+            .who_has_object_name(None, name, timeout)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("WhoHas(name) failed: {e}"))))
+    }
+
+    // -----------------------------------------------------------------------
+    // Private transfer
+    // -----------------------------------------------------------------------
+
+    /// Send a confirmed private transfer request for vendor-specific integrations.
+    pub async fn private_transfer(
+        &self,
+        device_instance: u32,
+        vendor_id: u32,
+        service_number: u32,
+        params: Option<&[u8]>,
+    ) -> Result<(u32, u32, Option<Vec<u8>>), BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let ack = with_client!(tc, |c| c
+            .private_transfer(dev.address, vendor_id, service_number, params)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("PrivateTransfer failed: {e}"))))?;
+        Ok((ack.vendor_id, ack.service_number, ack.result_block))
+    }
+
+    // -----------------------------------------------------------------------
+    // COV property subscriptions
+    // -----------------------------------------------------------------------
+
+    /// Subscribe to changes of a specific property on a remote BACnet device.
+    pub async fn subscribe_cov_property(
+        &self,
+        device_instance: u32,
+        object_id: ObjectId,
+        property_id: PropertyId,
+        cov_increment: Option<f32>,
+        lifetime: u32,
+    ) -> Result<(), BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        let request = SubscribeCovPropertyRequest {
+            subscriber_process_id: 0,
+            monitored_object_id: object_id,
+            issue_confirmed_notifications: Some(false),
+            lifetime_seconds: Some(lifetime),
+            monitored_property_id: property_id,
+            monitored_property_array_index: None,
+            cov_increment,
+            invoke_id: 0,
+        };
+        with_client!(tc, |c| c
+            .subscribe_cov_property(dev.address, request)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("SubscribeCOVProperty failed: {e}"))))
+    }
+
+    /// Cancel a COV property subscription on a remote BACnet device.
+    pub async fn cancel_cov_property_subscription(
+        &self,
+        device_instance: u32,
+        object_id: ObjectId,
+        property_id: PropertyId,
+    ) -> Result<(), BridgeError> {
+        let tc = self.require_transport()?;
+        let dev = self.find_device(device_instance)?;
+        with_client!(tc, |c| c
+            .cancel_cov_property_subscription(dev.address, 0, object_id, property_id, None)
+            .await
+            .map_err(|e| BridgeError::Protocol(format!("CancelCOVProperty failed: {e}"))))
+    }
+
+    // -----------------------------------------------------------------------
+    // Network routing (Phase 5D)
+    // -----------------------------------------------------------------------
+    // BACnet network routing uses NPDU-level (network-layer) messages such as
+    // Who-Is-Router-To-Network (message type 0x00) and I-Am-Router-To-Network
+    // (message type 0x01), defined in BACnet Clause 6.  These are NOT
+    // application-layer services — they live below the APDU layer.
+    //
+    // The rustbac client library does not currently expose an API for sending
+    // or receiving raw network-layer messages.  In practice, BACnet network
+    // routing is handled by dedicated router hardware (e.g., Contemporary
+    // Controls BASrouter, Cimetrics Eplus) that interconnects dissimilar
+    // BACnet data links (IP <-> MS/TP, IP <-> Ethernet, etc.).  The BAS
+    // head-end rarely needs to originate routing messages itself.
+    //
+    // The stubs below exist so the bridge API is feature-complete and can be
+    // wired to UI/CLI commands in the future once the underlying library
+    // gains raw NPDU support.
+    // -----------------------------------------------------------------------
+
+    /// Send a Who-Is-Router-To-Network request.
+    ///
+    /// `network_number` — if `Some`, asks which router can reach that
+    /// specific network; if `None`, asks for all reachable networks.
+    ///
+    /// Returns an error because the underlying BACnet client library does not
+    /// yet support sending network-layer messages.  In most deployments this
+    /// is handled by dedicated router appliances.
+    pub async fn who_is_router_to_network(
+        &self,
+        _network_number: Option<u16>,
+    ) -> Result<Vec<RouterEntry>, BridgeError> {
+        let _tc = self.require_transport()?;
+        Err(BridgeError::Protocol(
+            "Who-Is-Router-To-Network is not yet supported: the BACnet client library \
+             does not expose network-layer (NPDU) message APIs. In most deployments, \
+             network routing is handled by dedicated router hardware."
+                .to_string(),
+        ))
+    }
+
+    /// Query the local routing table (I-Am-Router-To-Network responses).
+    ///
+    /// Returns an error because the underlying BACnet client library does not
+    /// yet support network-layer message reception.
+    pub async fn get_routing_table(&self) -> Result<Vec<RouterEntry>, BridgeError> {
+        let _tc = self.require_transport()?;
+        Err(BridgeError::Protocol(
+            "Network routing table queries are not yet supported: the BACnet client \
+             library does not expose network-layer (NPDU) message APIs. In most \
+             deployments, network routing is handled by dedicated router hardware."
+                .to_string(),
+        ))
+    }
+
     fn find_device(&self, device_instance: u32) -> Result<&BacnetDevice, BridgeError> {
         self.devices
             .iter()
@@ -518,11 +1242,27 @@ impl BacnetBridge {
     }
 }
 
+/// An entry from the BACnet network routing table.
+///
+/// Represents a router that can reach a given destination network, as
+/// reported by I-Am-Router-To-Network messages.
+#[derive(Debug, Clone)]
+pub struct RouterEntry {
+    /// The BACnet network number reachable via this router.
+    pub destination_network: u16,
+    /// The router's address (IP:port or MAC, as a string).
+    pub router_address: String,
+}
+
 /// Summary of an event/alarm on a remote BACnet device.
 #[derive(Debug, Clone)]
 pub struct BacnetEventInfo {
     pub object_id: ObjectId,
     pub event_state: u32,
+    pub acknowledged_transitions: Option<Vec<u8>>,
+    pub notify_type: Option<u32>,
+    pub event_enable: Option<Vec<u8>>,
+    pub event_priorities: Option<[u32; 3]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -533,29 +1273,68 @@ impl super::traits::PointSource for BacnetBridge {
     async fn start(&mut self, store: PointStore) -> Result<(), BridgeError> {
         self.store = Some(store.clone());
 
+        // Build optional server handler for inline request dispatch.
+        let server_handler: Option<(Arc<ObjectStoreHandler>, u32)> = match (
+            &self.server_object_store,
+            self.server_device_instance,
+        ) {
+            (Some(obj_store), Some(dev_id)) => {
+                Some((Arc::new(ObjectStoreHandler::new(Arc::clone(obj_store))), dev_id))
+            }
+            _ => None,
+        };
+
         // 1. Create BACnet client (Normal, Foreign, or Secure Connect)
         match &self.bacnet_config.mode {
             BacnetMode::Normal => {
-                let client = BacnetClient::new()
+                let mut client = BacnetClient::new()
                     .await
                     .map_err(|e| BridgeError::ConnectionFailed(format!("BACnet/IP init: {e}")))?;
+                if let Some((handler, dev_id)) = server_handler {
+                    client = client.with_server_handler(handler, dev_id, 0);
+                }
                 let tc = TransportClient::Ip(Arc::new(client));
                 self.start_with_transport(tc, store.clone()).await?;
             }
             BacnetMode::Foreign { bbmd_addr, ttl } => {
                 println!("BACnet: registering as foreign device with BBMD {bbmd_addr} (TTL={ttl}s)");
-                let client = BacnetClient::new_foreign(*bbmd_addr, *ttl)
+                let mut client = BacnetClient::new_foreign(*bbmd_addr, *ttl)
                     .await
                     .map_err(|e| BridgeError::ConnectionFailed(format!("BACnet/IP foreign init: {e}")))?;
+                if let Some((handler, dev_id)) = server_handler {
+                    client = client.with_server_handler(handler, dev_id, 0);
+                }
                 let tc = TransportClient::Ip(Arc::new(client));
                 self.start_with_transport(tc, store.clone()).await?;
             }
             BacnetMode::SecureConnect { hub_endpoint } => {
                 println!("BACnet: connecting to SC hub {hub_endpoint}...");
-                let client = BacnetClient::new_sc(hub_endpoint.clone())
+                let mut client = BacnetClient::new_sc(hub_endpoint.clone())
                     .await
                     .map_err(|e| BridgeError::ConnectionFailed(format!("BACnet/SC init: {e}")))?;
+                if let Some((handler, dev_id)) = server_handler {
+                    client = client.with_server_handler(handler, dev_id, 0);
+                }
                 let tc = TransportClient::Sc(Arc::new(client));
+                self.start_with_transport(tc, store.clone()).await?;
+            }
+            BacnetMode::Mstp { port, baud_rate, mac_address, max_master } => {
+                println!("BACnet: opening MS/TP on {port} ({baud_rate} baud, MAC={mac_address})");
+                let config = MstpConfig {
+                    port: port.clone(),
+                    baud_rate: *baud_rate,
+                    mac_address: *mac_address,
+                    max_master: *max_master,
+                    max_info_frames: 1,
+                };
+                let transport = MstpTransport::new(config)
+                    .await
+                    .map_err(|e| BridgeError::ConnectionFailed(format!("MS/TP init: {e}")))?;
+                let mut client = BacnetClient::with_datalink(transport);
+                if let Some((handler, dev_id)) = server_handler {
+                    client = client.with_server_handler(handler, dev_id, 0);
+                }
+                let tc = TransportClient::Mstp(Arc::new(client));
                 self.start_with_transport(tc, store.clone()).await?;
             }
         }
@@ -649,6 +1428,8 @@ impl BacnetBridge {
         store: PointStore,
     ) -> Result<(), BridgeError> {
         let discovery_timeout = self.discovery_timeout;
+        // Store transport early so it's available even if discovery finds nothing
+        self.transport = Some(tc.clone());
         // 2. Discover devices via Who-Is broadcast
         println!(
             "BACnet: sending Who-Is broadcast (waiting {}s)...",
@@ -756,60 +1537,9 @@ impl BacnetBridge {
         }
 
         self.devices = all_devices;
-        self.transport = Some(tc.clone());
 
-        // 5. Start COV subscriptions with polling fallback
-        let cov_tc = tc.clone();
-        let cov_store = store.clone();
-        let cov_devices = self.devices.clone();
-        let poll_interval = self.poll_interval;
-        let cov_lifetime = self.cov_lifetime;
-        let cov_event_bus = self.event_bus.clone();
-
-        let cov_handle = tokio::spawn(async move {
-            run_cov_with_poll_fallback(
-                cov_tc,
-                cov_store,
-                &cov_devices,
-                poll_interval,
-                cov_lifetime,
-                cov_event_bus,
-            )
-            .await;
-        });
-        self.cov_handle = Some(cov_handle);
-
-        // 6. Start periodic time synchronization (every 4 hours)
-        let ts_tc = tc.clone();
-        let ts_devices = self.devices.clone();
-        let ts_handle = tokio::spawn(async move {
-            run_time_sync_loop(ts_tc, &ts_devices).await;
-        });
-        self.time_sync_handle = Some(ts_handle);
-
-        // 7. Start event notification polling (for intrinsic reporting)
-        let ev_tc = tc.clone();
-        let ev_devices = self.devices.clone();
-        let ev_event_bus = self.event_bus.clone();
-        let ev_store = store.clone();
-        let ev_handle = tokio::spawn(async move {
-            run_event_poll_loop(ev_tc, ev_store, &ev_devices, ev_event_bus).await;
-        });
-        self.event_poll_handle = Some(ev_handle);
-
-        // 8. Start periodic TrendLog sync (if any devices have TrendLog objects)
-        let has_trend_logs = self.devices.iter().any(|d| !d.trend_logs.is_empty());
-        if has_trend_logs {
-            if let Some(history_store) = &self.history_store {
-                let tl_tc = tc;
-                let tl_devices = self.devices.clone();
-                let tl_history = history_store.clone();
-                let tl_handle = tokio::spawn(async move {
-                    run_trend_log_sync_loop(tl_tc, &tl_devices, tl_history).await;
-                });
-                self.trend_log_handle = Some(tl_handle);
-            }
-        }
+        // 5. Start all background loops (COV/poll, time sync, event poll, trend log)
+        self.restart_background_loops(tc, store)?;
 
         Ok(())
     }
@@ -834,6 +1564,9 @@ async fn run_cov_with_poll_fallback(
             run_cov_inner(Arc::clone(client), store.clone(), devices, poll_interval, cov_lifetime, event_bus.clone()).await
         }
         TransportClient::Sc(client) => {
+            run_cov_inner(Arc::clone(client), store.clone(), devices, poll_interval, cov_lifetime, event_bus.clone()).await
+        }
+        TransportClient::Mstp(client) => {
             run_cov_inner(Arc::clone(client), store.clone(), devices, poll_interval, cov_lifetime, event_bus.clone()).await
         }
     };
@@ -927,51 +1660,7 @@ async fn run_cov_inner<D: DataLink + 'static>(
     true
 }
 
-// ---------------------------------------------------------------------------
-// Backoff state for reconnection logic
-// ---------------------------------------------------------------------------
-
-const BACKOFF_BASE_SECS: u64 = 2;
-const BACKOFF_MAX_SECS: u64 = 300; // 5 minutes
-const DEVICE_DOWN_THRESHOLD: u32 = 5;
-
-struct DeviceBackoff {
-    failures: u32,
-    next_retry: Instant,
-    was_down: bool,
-}
-
-impl DeviceBackoff {
-    fn new() -> Self {
-        Self {
-            failures: 0,
-            next_retry: Instant::now(),
-            was_down: false,
-        }
-    }
-
-    fn record_success(&mut self) {
-        self.failures = 0;
-        self.next_retry = Instant::now();
-    }
-
-    fn record_failure(&mut self) {
-        self.failures = self.failures.saturating_add(1);
-        let delay_secs = std::cmp::min(
-            BACKOFF_BASE_SECS.saturating_pow(self.failures),
-            BACKOFF_MAX_SECS,
-        );
-        self.next_retry = Instant::now() + Duration::from_secs(delay_secs);
-    }
-
-    fn should_skip(&self) -> bool {
-        Instant::now() < self.next_retry
-    }
-
-    fn is_down(&self) -> bool {
-        self.failures >= DEVICE_DOWN_THRESHOLD
-    }
-}
+use super::backoff::DeviceBackoff;
 
 /// Simple periodic polling fallback when COV is unavailable.
 async fn poll_loop(
@@ -1199,28 +1888,59 @@ async fn run_event_poll_loop(
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     loop {
-        for dev in devices {
-            let dev_key = format!("bacnet-{}", dev.device_id.instance());
-
-            // Try to receive any unsolicited event notifications (non-blocking check)
+        // Drain any unsolicited event notifications first (global receive, not
+        // per-device). The notification's initiating_device_id tells us which
+        // device it came from.
+        loop {
             match with_client!(&tc, |c| c
                 .recv_event_notification(Duration::from_millis(100))
                 .await)
             {
                 Ok(Some(notification)) => {
-                    handle_event_notification(&store, &event_bus, &dev_key, &notification);
+                    // Extract the correct device key from the notification itself
+                    let notif_dev_key = format!(
+                        "bacnet-{}",
+                        notification.initiating_device_id.instance()
+                    );
+                    handle_event_notification(&store, &event_bus, &notif_dev_key, &notification);
                 }
-                Ok(None) => {} // no pending notification
-                Err(_) => {}   // timeout or error, continue
+                Ok(None) => break,  // no more pending notifications
+                Err(_) => break,    // timeout or error, stop draining
             }
+        }
 
-            // Also poll GetEventInformation for this device
+        // Poll GetEventInformation for each device
+        for dev in devices {
+            let dev_key = format!("bacnet-{}", dev.device_id.instance());
+
             match with_client!(&tc, |c| c.get_event_information(dev.address, None).await) {
                 Ok(result) => {
+                    // Collect the set of object IDs currently in alarm
+                    let alarmed_objects: HashSet<ObjectId> = result
+                        .summaries
+                        .iter()
+                        .filter(|s| s.event_state_raw != 0)
+                        .map(|s| s.object_id)
+                        .collect();
+
+                    // Clear ALARM flags for objects that have returned to normal
+                    // (i.e. they are known objects on this device but are NOT in
+                    // the current alarm summary).
+                    for obj in &dev.objects {
+                        if !alarmed_objects.contains(&obj.object_id) {
+                            let pid = object_point_id(obj);
+                            let key = PointKey {
+                                device_instance_id: dev_key.clone(),
+                                point_id: pid.clone(),
+                            };
+                            // clear_status is a no-op if the flag is not set
+                            store.clear_status(&key, PointStatusFlags::ALARM);
+                        }
+                    }
+
+                    // Set ALARM flags for objects currently in alarm
                     for summary in &result.summaries {
-                        // event_state_raw: 0=normal, 1=fault, 2=offnormal, 3=high-limit, 4=low-limit
                         if summary.event_state_raw != 0 {
-                            // Find matching point
                             let point_id = dev
                                 .objects
                                 .iter()
@@ -1228,7 +1948,6 @@ async fn run_event_poll_loop(
                                 .map(object_point_id);
 
                             if let Some(pid) = point_id {
-                                // Set ALARM flag on the point
                                 let key = PointKey {
                                     device_instance_id: dev_key.clone(),
                                     point_id: pid.clone(),
@@ -1271,7 +1990,7 @@ fn handle_event_notification(
     // Map to_state to alarm action
     let is_alarm = notification
         .to_state
-        .map(|s| s != rustbac_client::EventState::Normal)
+        .map(|s| s != EventState::Normal)
         .unwrap_or(notification.to_state_raw != 0);
 
     let point_id = format!(
@@ -1662,60 +2381,6 @@ mod tests {
     use super::*;
     use crate::config::scenario::{BacnetNetworkConfig, ScenarioSettings};
 
-    // -- Backoff progression --------------------------------------------------
-
-    #[test]
-    fn backoff_initial_state() {
-        let b = DeviceBackoff::new();
-        assert!(!b.should_skip());
-        assert!(!b.is_down());
-        assert_eq!(b.failures, 0);
-    }
-
-    #[test]
-    fn backoff_progression() {
-        let mut b = DeviceBackoff::new();
-
-        // First failure: delay = 2^1 = 2s
-        b.record_failure();
-        assert_eq!(b.failures, 1);
-        assert!(b.should_skip()); // within the 2s window
-        assert!(!b.is_down());
-
-        // Accumulate to threshold
-        for _ in 1..DEVICE_DOWN_THRESHOLD {
-            b.record_failure();
-        }
-        assert_eq!(b.failures, DEVICE_DOWN_THRESHOLD);
-        assert!(b.is_down());
-    }
-
-    #[test]
-    fn backoff_success_resets() {
-        let mut b = DeviceBackoff::new();
-        for _ in 0..DEVICE_DOWN_THRESHOLD {
-            b.record_failure();
-        }
-        assert!(b.is_down());
-
-        b.record_success();
-        assert_eq!(b.failures, 0);
-        assert!(!b.is_down());
-        assert!(!b.should_skip());
-    }
-
-    #[test]
-    fn backoff_delay_capped() {
-        let mut b = DeviceBackoff::new();
-        // Many failures — delay should cap at BACKOFF_MAX_SECS
-        for _ in 0..50 {
-            b.record_failure();
-        }
-        // next_retry should be at most BACKOFF_MAX_SECS from now
-        let max_future = Instant::now() + Duration::from_secs(BACKOFF_MAX_SECS + 1);
-        assert!(b.next_retry < max_future);
-    }
-
     // -- StatusFlags mapping --------------------------------------------------
 
     #[test]
@@ -1881,6 +2546,8 @@ mod tests {
             tick_rate_ms: Some(100),
             realtime: None,
             bacnet: None,
+            modbus: None,
+            protocols: Default::default(),
         });
         let config = bacnet_config_from_scenario(&settings);
         assert!(matches!(config.mode, BacnetMode::Normal));
@@ -1896,7 +2563,14 @@ mod tests {
                 bbmd_addr: None,
                 ttl: None,
                 hub_endpoint: None,
+                server_device_instance: None,
+                serial_port: None,
+                baud_rate: None,
+                mac_address: None,
+                max_master: None,
             }),
+            modbus: None,
+            protocols: Default::default(),
         });
         let config = bacnet_config_from_scenario(&settings);
         assert!(matches!(config.mode, BacnetMode::Normal));
@@ -1912,7 +2586,14 @@ mod tests {
                 bbmd_addr: Some("192.168.1.1:47808".into()),
                 ttl: Some(120),
                 hub_endpoint: None,
+                server_device_instance: None,
+                serial_port: None,
+                baud_rate: None,
+                mac_address: None,
+                max_master: None,
             }),
+            modbus: None,
+            protocols: Default::default(),
         });
         let config = bacnet_config_from_scenario(&settings);
         match config.mode {
@@ -1934,7 +2615,14 @@ mod tests {
                 bbmd_addr: None,
                 ttl: None,
                 hub_endpoint: Some("wss://hub.example.com:1234/bacnet".into()),
+                server_device_instance: None,
+                serial_port: None,
+                baud_rate: None,
+                mac_address: None,
+                max_master: None,
             }),
+            modbus: None,
+            protocols: Default::default(),
         });
         let config = bacnet_config_from_scenario(&settings);
         match config.mode {
@@ -1942,6 +2630,68 @@ mod tests {
                 assert_eq!(hub_endpoint, "wss://hub.example.com:1234/bacnet");
             }
             other => panic!("expected SecureConnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_from_scenario_mstp() {
+        let settings = Some(ScenarioSettings {
+            tick_rate_ms: None,
+            realtime: None,
+            bacnet: Some(BacnetNetworkConfig {
+                mode: Some("mstp".into()),
+                bbmd_addr: None,
+                ttl: None,
+                hub_endpoint: None,
+                server_device_instance: None,
+                serial_port: Some("/dev/ttyUSB0".into()),
+                baud_rate: Some(9600),
+                mac_address: Some(1),
+                max_master: Some(64),
+            }),
+            modbus: None,
+            protocols: Default::default(),
+        });
+        let config = bacnet_config_from_scenario(&settings);
+        match config.mode {
+            BacnetMode::Mstp { port, baud_rate, mac_address, max_master } => {
+                assert_eq!(port, "/dev/ttyUSB0");
+                assert_eq!(baud_rate, 9600);
+                assert_eq!(mac_address, 1);
+                assert_eq!(max_master, 64);
+            }
+            other => panic!("expected Mstp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_from_scenario_mstp_defaults() {
+        // MS/TP mode without explicit params should use defaults
+        let settings = Some(ScenarioSettings {
+            tick_rate_ms: None,
+            realtime: None,
+            bacnet: Some(BacnetNetworkConfig {
+                mode: Some("mstp".into()),
+                bbmd_addr: None,
+                ttl: None,
+                hub_endpoint: None,
+                server_device_instance: None,
+                serial_port: None,
+                baud_rate: None,
+                mac_address: None,
+                max_master: None,
+            }),
+            modbus: None,
+            protocols: Default::default(),
+        });
+        let config = bacnet_config_from_scenario(&settings);
+        match config.mode {
+            BacnetMode::Mstp { baud_rate, mac_address, max_master, .. } => {
+                assert_eq!(baud_rate, 38400);
+                assert_eq!(mac_address, 0);
+                assert_eq!(max_master, 127);
+            }
+            other => panic!("expected Mstp, got {other:?}"),
         }
     }
 
@@ -1956,7 +2706,14 @@ mod tests {
                 bbmd_addr: None,
                 ttl: None,
                 hub_endpoint: None,
+                server_device_instance: None,
+                serial_port: None,
+                baud_rate: None,
+                mac_address: None,
+                max_master: None,
             }),
+            modbus: None,
+            protocols: Default::default(),
         });
         let config = bacnet_config_from_scenario(&settings);
         match config.mode {
@@ -2032,5 +2789,22 @@ mod tests {
         // Timestamp should be 2024-01-01 12:30:00 UTC in ms
         let expected_ts = 19723 * 86400 * 1000 + 12 * 3600000 + 30 * 60000;
         assert_eq!(samples[0].0, expected_ts);
+    }
+
+    // -- BacnetEventInfo enriched fields ------------------------------------
+
+    #[test]
+    fn bacnet_event_info_has_extended_fields() {
+        let info = BacnetEventInfo {
+            object_id: ObjectId::new(ObjectType::AnalogInput, 1),
+            event_state: 2,
+            acknowledged_transitions: Some(vec![0xE0]),
+            notify_type: Some(1),
+            event_enable: Some(vec![0xE0]),
+            event_priorities: Some([3, 3, 3]),
+        };
+        assert_eq!(info.event_state, 2);
+        assert!(info.acknowledged_transitions.is_some());
+        assert_eq!(info.event_priorities.unwrap(), [3, 3, 3]);
     }
 }

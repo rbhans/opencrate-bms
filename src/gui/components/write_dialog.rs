@@ -8,6 +8,7 @@ pub fn WriteDialog(device_id: String, point_id: String) -> Element {
     let state = use_context::<AppState>();
     let mut input_value = use_signal(|| String::new());
     let mut local_error = use_signal(|| Option::<String>::None);
+    let mut selected_priority = use_signal(|| 16u8);
 
     // Find the point definition to know kind + constraints
     let profile_point = state
@@ -21,8 +22,18 @@ pub fn WriteDialog(device_id: String, point_id: String) -> Element {
         .map(|p| p.kind.clone())
         .unwrap_or(PointKind::Analog);
     let constraints = profile_point.and_then(|p| p.constraints.clone());
-    let priority = profile_point.and_then(|p| {
+    let profile_priority = profile_point.and_then(|p| {
         p.protocols.as_ref()?.bacnet.as_ref()?.priority
+    });
+    // Initialize selected_priority from profile on first render only
+    let mut priority_initialized = use_signal(|| false);
+    use_effect(move || {
+        if !*priority_initialized.read() {
+            if let Some(p) = profile_priority {
+                selected_priority.set(p);
+            }
+            priority_initialized.set(true);
+        }
     });
 
     // Clone what we need for the closure
@@ -86,7 +97,7 @@ pub fn WriteDialog(device_id: String, point_id: String) -> Element {
                         device_id: dev_id.clone(),
                         point_id: pt_id.clone(),
                         value,
-                        priority,
+                        priority: Some(*selected_priority.read()),
                     };
                     if write_tx.send(cmd).is_err() {
                         local_error.set(Some("Write channel closed.".into()));
@@ -126,6 +137,31 @@ pub fn WriteDialog(device_id: String, point_id: String) -> Element {
                             on_submit_key();
                         }
                     },
+                }
+                select {
+                    class: "write-priority-select",
+                    value: "{selected_priority}",
+                    onchange: move |evt: Event<FormData>| {
+                        if let Ok(p) = evt.value().parse::<u8>() {
+                            selected_priority.set(p);
+                        }
+                    },
+                    option { value: "16", "16 — Default" }
+                    option { value: "15", "15" }
+                    option { value: "14", "14" }
+                    option { value: "13", "13" }
+                    option { value: "12", "12" }
+                    option { value: "11", "11" }
+                    option { value: "10", "10" }
+                    option { value: "9", "9" }
+                    option { value: "8", "8 — Manual Operator" }
+                    option { value: "7", "7" }
+                    option { value: "6", "6" }
+                    option { value: "5", "5 — Critical Equipment" }
+                    option { value: "4", "4" }
+                    option { value: "3", "3" }
+                    option { value: "2", "2 — Auto Life Safety" }
+                    option { value: "1", "1 — Manual Life Safety" }
                 }
                 button {
                     onclick: move |_| on_submit(),

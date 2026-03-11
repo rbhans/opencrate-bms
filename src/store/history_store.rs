@@ -578,7 +578,7 @@ pub fn start_history_collector(
     start_history_collector_with_path(store, devices, &db_dir.join("history.db"))
 }
 
-fn start_history_collector_with_path(
+pub fn start_history_collector_with_path(
     store: &PointStore,
     devices: &[LoadedDevice],
     db_path: &Path,

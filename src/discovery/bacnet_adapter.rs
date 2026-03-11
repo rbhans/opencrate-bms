@@ -7,7 +7,7 @@ use crate::node::ProtocolBinding;
 
 use super::bacnet_units::bacnet_unit_to_string;
 use super::model::{
-    ConnStatus, DeviceState, DiscoveredDevice, DiscoveredPoint, DiscoveryProtocol, PointKindHint,
+    ConnStatus, DeviceState, DiscoveredDevice, DiscoveredPoint, PointKindHint, PROTOCOL_BACNET,
 };
 
 /// Convert a BACnet device into a protocol-agnostic DiscoveredDevice.
@@ -15,7 +15,7 @@ pub fn adapt_bacnet_device(dev: &BacnetDevice) -> DiscoveredDevice {
     let instance = dev.device_id.instance();
     DiscoveredDevice {
         id: format!("bacnet-{instance}"),
-        protocol: DiscoveryProtocol::Bacnet,
+        protocol: PROTOCOL_BACNET.into(),
         state: DeviceState::Discovered,
         conn_status: ConnStatus::Online,
         display_name: format!("BACnet Device {instance}"),
@@ -57,11 +57,11 @@ pub fn adapt_bacnet_points(dev: &BacnetDevice) -> Vec<DiscoveredPoint> {
                 units,
                 point_kind,
                 writable: obj.writable,
-                binding: ProtocolBinding::Bacnet {
+                binding: ProtocolBinding::bacnet(
                     device_instance,
-                    object_type: obj_type_str.clone(),
-                    object_instance: obj.object_id.instance(),
-                },
+                    &obj_type_str,
+                    obj.object_id.instance(),
+                ),
                 protocol_meta: serde_json::json!({
                     "object_type": obj_type_str,
                     "object_instance": obj.object_id.instance(),
@@ -167,7 +167,7 @@ mod tests {
         let adapted = adapt_bacnet_device(&dev);
 
         assert_eq!(adapted.id, "bacnet-1000");
-        assert_eq!(adapted.protocol, DiscoveryProtocol::Bacnet);
+        assert_eq!(adapted.protocol, PROTOCOL_BACNET);
         assert_eq!(adapted.state, DeviceState::Discovered);
         assert_eq!(adapted.conn_status, ConnStatus::Online);
         assert_eq!(adapted.display_name, "BACnet Device 1000");
@@ -211,16 +211,9 @@ mod tests {
         let dev = make_test_device();
         let points = adapt_bacnet_points(&dev);
 
-        match &points[0].binding {
-            ProtocolBinding::Bacnet {
-                device_instance,
-                object_instance,
-                ..
-            } => {
-                assert_eq!(*device_instance, 1000);
-                assert_eq!(*object_instance, 1);
-            }
-            _ => panic!("expected BACnet binding"),
-        }
+        let binding = &points[0].binding;
+        assert!(binding.is_bacnet());
+        assert_eq!(binding.config["device_instance"], 1000);
+        assert_eq!(binding.config["object_instance"], 1);
     }
 }

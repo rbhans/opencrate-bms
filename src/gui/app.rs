@@ -1,48 +1,196 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::bridge::bacnet::{bacnet_config_from_scenario, BacnetBridge};
-use crate::bridge::modbus::ModbusBridge;
+use crate::bridge::modbus::{modbus_config_from_scenario, ModbusBridge};
 use crate::bridge::traits::PointSource;
 use crate::config::loader::resolve_scenario;
 use crate::event::bus::{Event, EventBus};
 use crate::discovery::service::DiscoveryService;
-use crate::store::alarm_store::start_alarm_engine;
-use crate::store::discovery_store::{start_conn_status_listener, start_discovery_store};
-use crate::store::entity_store::start_entity_store;
-use crate::store::history_store::start_history_collector;
-use crate::store::node_store::start_node_store;
+use crate::project::{load_project_meta, ProjectMeta, ProjectPaths};
+use crate::store::alarm_store::start_alarm_engine_with_path;
+use crate::store::discovery_store::{start_conn_status_listener, start_discovery_store_with_path};
+use crate::store::entity_store::start_entity_store_with_path;
+use crate::store::history_store::start_history_collector_with_path;
+use crate::config::template::auto_create_nodes;
+use crate::store::node_store::start_node_store_with_path;
 use crate::store::point_store::{PointKey, PointStatusFlags, PointStore};
-use crate::store::schedule_store::start_schedule_engine;
+use crate::store::schedule_store::start_schedule_engine_with_path;
+use crate::auth::AllRolePermissions;
+use crate::store::user_store::{start_user_store_with_path, User, UserStore};
+use crate::logic::engine::ExecutionEngine;
+use crate::logic::store::start_program_store_with_path;
 
 use super::components::alarm_view::AlarmView;
 use super::components::config_view::ConfigView;
 use super::components::point_detail::PointDetail;
 use super::components::point_table::PointTable;
+use super::components::login::{AdminSetup, LoginScreen};
+use super::components::project_launcher::ProjectLauncher;
 use super::components::schedule_view::ScheduleView;
 use super::components::sidebar::Sidebar;
 use super::components::toolbar::Toolbar;
 use super::components::floor_plan::FloorPlanCanvas;
 use super::components::trend_chart::TrendView;
-use super::state::{ActiveView, AppState, DashboardTool, SidebarTab, WriteCommand};
+use super::state::{ActiveView, AppState, CloseAction, DashboardTool, SidebarTab, WriteCommand};
 
 #[component]
 pub fn App() -> Element {
-    let scenario_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("scenarios/small-office.json"));
-    let profiles_dir = PathBuf::from("profiles");
+    let mut phase = use_signal(|| Option::<ProjectPaths>::None);
+    let mut initial_tab = use_signal(|| Option::<CloseAction>::None);
 
-    let loaded = use_hook(|| {
-        resolve_scenario(&scenario_path, &profiles_dir).unwrap_or_else(|e| {
-            eprintln!("Failed to load scenario: {e}");
-            std::process::exit(1);
+    let current_phase = phase.read().clone();
+
+    rsx! {
+        document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
+
+        if let Some(paths) = current_phase {
+            ProjectGate {
+                key: "{paths.root.display()}",
+                paths: paths.clone(),
+                on_close: move |action: CloseAction| {
+                    initial_tab.set(Some(action));
+                    phase.set(None);
+                },
+            }
+        } else {
+            ProjectLauncher {
+                on_open: move |paths: ProjectPaths| {
+                    phase.set(Some(paths));
+                },
+                initial_action: *initial_tab.read(),
+            }
+        }
+    }
+}
+
+/// Gate component: creates UserStore, checks for users, shows login/setup or ProjectApp.
+#[component]
+fn ProjectGate(paths: ProjectPaths, on_close: EventHandler<CloseAction>) -> Element {
+    let project_paths = use_hook(|| paths.clone());
+
+    // Ensure data directory exists
+    use_hook(|| {
+        let _ = std::fs::create_dir_all(&project_paths.data_dir);
+    });
+
+    let user_store = use_hook(|| {
+        start_user_store_with_path(&project_paths.db_path("users.db"))
+    });
+
+    let mut current_user = use_signal(|| Option::<User>::None);
+    let mut needs_setup = use_signal(|| Option::<bool>::None);
+    let role_permissions = use_signal(AllRolePermissions::default);
+
+    // Check if any users exist on mount + load role permissions
+    {
+        let store = user_store.clone();
+        let mut rp = role_permissions;
+        let _ = use_resource(move || {
+            let store = store.clone();
+            async move {
+                let has_users = store.has_any_users().await;
+                needs_setup.set(Some(!has_users));
+                let perms = store.get_all_role_permissions().await;
+                rp.set(perms);
+            }
+        });
+    }
+
+    let setup_check = needs_setup.read().clone();
+    let logged_in = current_user.read().is_some();
+
+    rsx! {
+        document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
+
+        if setup_check.is_none() {
+            // Loading...
+            div { class: "login-backdrop",
+                div { class: "login-card",
+                    p { "Loading..." }
+                }
+            }
+        } else if setup_check == Some(true) && !logged_in {
+            // No users — show admin setup
+            AdminSetup {
+                user_store: user_store.clone(),
+                on_login: move |user: User| {
+                    current_user.set(Some(user));
+                    needs_setup.set(Some(false));
+                },
+            }
+        } else if !logged_in {
+            // Users exist — show login
+            LoginScreen {
+                user_store: user_store.clone(),
+                on_login: move |user: User| {
+                    current_user.set(Some(user));
+                },
+            }
+        } else {
+            // Logged in — show main app
+            ProjectApp {
+                paths: paths.clone(),
+                on_close: move |action: CloseAction| {
+                    on_close.call(action);
+                },
+                user_store: user_store.clone(),
+                current_user: current_user,
+                role_permissions: role_permissions,
+            }
+        }
+    }
+}
+
+#[component]
+fn ProjectApp(
+    paths: ProjectPaths,
+    on_close: EventHandler<CloseAction>,
+    user_store: UserStore,
+    current_user: Signal<Option<User>>,
+    role_permissions: Signal<AllRolePermissions>,
+) -> Element {
+    let project_paths = use_hook(|| paths.clone());
+    let project_meta = use_hook(|| {
+        load_project_meta(&paths.root).unwrap_or_else(|_| ProjectMeta {
+            id: "unknown".to_string(),
+            name: "Unknown Project".to_string(),
+            description: String::new(),
+            created_ms: 0,
+            version: "0.1.0".to_string(),
         })
     });
+
+    // Ensure data directory exists
+    use_hook(|| {
+        let _ = std::fs::create_dir_all(&project_paths.data_dir);
+    });
+
+    let load_result = use_hook(|| {
+        resolve_scenario(&project_paths.scenario, &project_paths.profiles_dir)
+            .map_err(|e| format!("{e}"))
+    });
+    let loaded = match load_result {
+        Ok(ref l) => l.clone(),
+        Err(ref err_msg) => {
+            let msg = err_msg.clone();
+            return rsx! {
+                div { class: "app-shell",
+                    div { class: "view-placeholder",
+                        h2 { "Failed to load project" }
+                        p { "{msg}" }
+                        button {
+                            class: "btn btn-primary",
+                            onclick: move |_| on_close.call(CloseAction::ToRecent),
+                            "Back to Projects"
+                        }
+                    }
+                }
+            };
+        }
+    };
 
     let event_bus = use_hook(EventBus::new);
 
@@ -54,13 +202,37 @@ pub fn App() -> Element {
         s
     });
 
-    let node_store = use_hook(|| start_node_store().with_event_bus(event_bus.clone()));
-    let history_store = use_hook(|| start_history_collector(&store, &loaded.devices));
-    let alarm_store = use_hook(|| start_alarm_engine(&store, &loaded).with_event_bus(event_bus.clone()));
-    let schedule_store = use_hook(|| start_schedule_engine(&store).with_event_bus(event_bus.clone()));
-    let entity_store = use_hook(|| start_entity_store().with_event_bus(event_bus.clone()));
+    let node_store = use_hook(|| {
+        start_node_store_with_path(&project_paths.db_path("nodes.db")).with_event_bus(event_bus.clone())
+    });
+
+    // Populate node store from scenario (equip + point nodes with auto-tagging)
+    {
+        let ns = node_store.clone();
+        let ld = loaded.clone();
+        let _ = use_resource(move || {
+            let ns = ns.clone();
+            let ld = ld.clone();
+            async move {
+                auto_create_nodes(&ns, &ld).await;
+            }
+        });
+    }
+
+    let history_store = use_hook(|| {
+        start_history_collector_with_path(&store, &loaded.devices, &project_paths.db_path("history.db"))
+    });
+    let alarm_store = use_hook(|| {
+        start_alarm_engine_with_path(&store, &project_paths.db_path("alarms.db")).with_event_bus(event_bus.clone())
+    });
+    let schedule_store = use_hook(|| {
+        start_schedule_engine_with_path(&store, &project_paths.db_path("schedules.db")).with_event_bus(event_bus.clone())
+    });
+    let entity_store = use_hook(|| {
+        start_entity_store_with_path(&project_paths.db_path("entities.db")).with_event_bus(event_bus.clone())
+    });
     let discovery_store = use_hook(|| {
-        let ds = start_discovery_store().with_event_bus(event_bus.clone());
+        let ds = start_discovery_store_with_path(&project_paths.db_path("discovery.db")).with_event_bus(event_bus.clone());
         start_conn_status_listener(ds.clone(), event_bus.clone());
         ds
     });
@@ -70,7 +242,44 @@ pub fn App() -> Element {
             node_store.clone(),
             entity_store.clone(),
             event_bus.clone(),
+            store.clone(),
         ))
+    });
+    let (write_tx, write_rx) = use_hook(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteCommand>();
+        (tx, Arc::new(Mutex::new(Some(rx))))
+    });
+
+    // Shutdown token for background tasks that outlive the dioxus scope
+    let shutdown_token = use_hook(|| tokio_util::sync::CancellationToken::new());
+
+    let program_store = use_hook(|| {
+        let ps = start_program_store_with_path(&project_paths.db_path("programs.db"));
+        let write_tx_cb = write_tx.clone();
+        let write_cb: crate::logic::engine::WriteCallback = std::sync::Arc::new(move |node_id: &str, value: crate::config::profile::PointValue, priority: Option<u8>| {
+            if let Some((dev, pt)) = node_id.split_once('/') {
+                let _ = write_tx_cb.send(WriteCommand {
+                    device_id: dev.to_string(),
+                    point_id: pt.to_string(),
+                    value,
+                    priority,
+                });
+            }
+        });
+        let engine = ExecutionEngine {
+            program_store: ps.clone(),
+            point_store: store.clone(),
+            event_bus: event_bus.clone(),
+            write_callback: Some(write_cb),
+        };
+        let handle = engine.start();
+        // Store handle so we can abort on shutdown
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            handle.abort();
+        });
+        ps
     });
 
     let mut store_version = use_signal(|| 0u64);
@@ -93,11 +302,6 @@ pub fn App() -> Element {
     let quick_trend_point = use_signal(|| Option::<String>::None);
     let quick_trend_range = use_signal(|| crate::gui::state::TrendRange::Hour1);
 
-    let (write_tx, write_rx) = use_hook(|| {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteCommand>();
-        (tx, Arc::new(Mutex::new(Some(rx))))
-    });
-
     // Shared bridge handles — created before AppState so discovery view can access them
     let bacnet_bridge: Arc<Mutex<Option<BacnetBridge>>> = use_hook(|| Arc::new(Mutex::new(None)));
     let modbus_bridge: Arc<Mutex<Option<ModbusBridge>>> = use_hook(|| Arc::new(Mutex::new(None)));
@@ -107,6 +311,8 @@ pub fn App() -> Element {
         node_store: node_store.clone(),
         event_bus: event_bus.clone(),
         loaded: loaded.clone(),
+        project_meta: project_meta.clone(),
+        project_paths: project_paths.clone(),
         active_view,
         sidebar_tab,
         selected_device,
@@ -134,8 +340,19 @@ pub fn App() -> Element {
         discovery_store: discovery_store.clone(),
         discovery_service: discovery_service.clone(),
         bacnet_bridge: bacnet_bridge.clone(),
+        modbus_bridge: modbus_bridge.clone(),
+        program_store: program_store.clone(),
+        current_user,
+        user_store: user_store.clone(),
+        role_permissions,
     });
     use_context_provider(|| app_state.clone());
+
+    // Cancel background tasks (logic engine, bridges) when this component unmounts
+    let drop_token = shutdown_token.clone();
+    use_drop(move || {
+        drop_token.cancel();
+    });
 
     // Store watcher + bridge startup
     let watcher_store = store.clone();
@@ -144,8 +361,11 @@ pub fn App() -> Element {
     let bacnet_for_start = bacnet_bridge.clone();
     let modbus_for_start = modbus_bridge.clone();
     let bacnet_config = bacnet_config_from_scenario(&loaded.config.settings);
+    let modbus_config = modbus_config_from_scenario(&loaded.config.settings);
     let bridge_event_bus = event_bus.clone();
+    let bridge_event_bus2 = event_bus.clone();
     let bridge_history = history_store.clone();
+    let bridge_shutdown = shutdown_token.clone();
     use_hook(move || {
         spawn(async move {
             let mut rx = watcher_store.subscribe();
@@ -161,20 +381,40 @@ pub fn App() -> Element {
                 .with_bacnet_config(bacnet_config)
                 .with_event_bus(bridge_event_bus)
                 .with_history_store(bridge_history);
+
+            // Init server object store BEFORE start() so the server handler is available when transport is created
+            if let Some(server_instance) = bridge_loaded.config.settings
+                .as_ref()
+                .and_then(|s| s.bacnet.as_ref())
+                .and_then(|b| b.server_device_instance)
+            {
+                bacnet.init_server_store(server_instance, &bridge_store);
+            }
+
             if let Err(e) = bacnet.start(bridge_store.clone()).await {
                 eprintln!("BACnet bridge error: {e}");
             }
             *bacnet_for_start.lock().await = Some(bacnet);
 
-            let mut modbus =
-                ModbusBridge::new().from_loaded_devices(&bridge_loaded.devices);
+            let mut modbus = ModbusBridge::new()
+                .with_modbus_config(modbus_config)
+                .with_event_bus(bridge_event_bus2)
+                .from_loaded_devices(&bridge_loaded.devices);
             if let Err(e) = modbus.start(bridge_store.clone()).await {
                 eprintln!("Modbus bridge error: {e}");
             }
             *modbus_for_start.lock().await = Some(modbus);
 
-            // Keep bridges alive
-            std::future::pending::<()>().await;
+            // Keep bridges alive until shutdown
+            bridge_shutdown.cancelled().await;
+
+            // Gracefully stop bridges
+            if let Some(ref mut b) = *bacnet_for_start.lock().await {
+                let _ = b.stop().await;
+            }
+            if let Some(ref mut m) = *modbus_for_start.lock().await {
+                let _ = m.stop().await;
+            }
         });
     });
 
@@ -319,10 +559,12 @@ pub fn App() -> Element {
     let is_config = matches!(current_view, ActiveView::Config);
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
-
         div { class: "app-shell",
-            Toolbar {}
+            Toolbar {
+                on_close_project: move |action: CloseAction| {
+                    on_close.call(action);
+                },
+            }
 
             div { class: "app-body",
                 if is_history {

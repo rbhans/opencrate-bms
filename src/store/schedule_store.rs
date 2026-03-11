@@ -1946,7 +1946,7 @@ pub fn start_schedule_engine(store: &PointStore) -> ScheduleStore {
     start_schedule_engine_with_path(store, &db_dir.join("schedules.db"))
 }
 
-fn start_schedule_engine_with_path(store: &PointStore, db_path: &Path) -> ScheduleStore {
+pub fn start_schedule_engine_with_path(store: &PointStore, db_path: &Path) -> ScheduleStore {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (config_version_tx, config_version_rx) = watch::channel(0u64);
 

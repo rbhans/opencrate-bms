@@ -10,14 +10,22 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 dioxus = { version = "0.6", features = ["desktop"], optional = true }
 rfd = { version = "0.15", optional = true }
-rustbac-core = "0.3"
-rustbac-client = "0.3"
-rustbac-datalink = "0.3"
-rustbac-bacnet-sc = "0.3"
-rustmod-core = "0.2"
-rustmod-client = "0.2"
-rustmod-datalink = "0.2"
+rustbac-core = { path = "../rust-bac/crates/rustbac-core" }
+rustbac-client = { path = "../rust-bac/crates/rustbac-client" }
+rustbac-datalink = { path = "../rust-bac/crates/rustbac-datalink" }
+rustbac-bacnet-sc = { path = "../rust-bac/crates/rustbac-bacnet-sc" }
+rustbac-mstp = { path = "../rust-bac/crates/rustbac-mstp" }
+rustmod-core = { path = "../rust-mod/crates/rustmod-core" }
+rustmod-client = { path = "../rust-mod/crates/rustmod-client" }
+rustmod-datalink = { path = "../rust-mod/crates/rustmod-datalink", features = ["rtu"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
+rhai = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+tar = "0.4"
+tokio-util = "0.7"
+argon2 = "0.5"
+rand = "0.8"
 
 [features]
 default = []

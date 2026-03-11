@@ -121,6 +121,20 @@ impl PointStore {
         }
     }
 
+    /// Like `set`, but only fires events/history if the value actually changed.
+    /// Use in poll loops to avoid duplicate events when the device returns the same value.
+    pub fn set_if_changed(&self, key: PointKey, value: PointValue) {
+        {
+            let data = self.data.read().unwrap();
+            if let Some(existing) = data.get(&key) {
+                if existing.value == value {
+                    return;
+                }
+            }
+        }
+        self.set(key, value);
+    }
+
     pub fn get_all_for_device(&self, device_instance_id: &str) -> Vec<(PointKey, TimestampedValue)> {
         self.data
             .read()
@@ -206,6 +220,13 @@ impl PointStore {
                 flags,
             });
         }
+    }
+
+    /// Remove all points belonging to a specific device.
+    /// Used during rescan to clear stale points before repopulating.
+    pub fn remove_device_points(&self, device_instance_id: &str) {
+        let mut data = self.data.write().unwrap();
+        data.retain(|k, _| k.device_instance_id != device_instance_id);
     }
 
     /// Get all point keys (for status sync iteration)
@@ -324,6 +345,29 @@ mod tests {
         store.set(key.clone(), PointValue::Float(60.0));
         let result = store.get(&key).unwrap();
         assert!(result.status.has(PointStatusFlags::ALARM));
+        assert!(matches!(result.value, PointValue::Float(f) if (f - 60.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn set_if_changed_skips_duplicate() {
+        let store = PointStore::new();
+        let key = PointKey {
+            device_instance_id: "ahu-1".to_string(),
+            point_id: "dat".to_string(),
+        };
+
+        store.set(key.clone(), PointValue::Float(55.0));
+        let v1 = store.get(&key).unwrap().timestamp;
+
+        // Same value — timestamp should NOT change (set_if_changed is a no-op)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.set_if_changed(key.clone(), PointValue::Float(55.0));
+        let v2 = store.get(&key).unwrap().timestamp;
+        assert_eq!(v1, v2);
+
+        // Different value — should update
+        store.set_if_changed(key.clone(), PointValue::Float(60.0));
+        let result = store.get(&key).unwrap();
         assert!(matches!(result.value, PointValue::Float(f) if (f - 60.0).abs() < f64::EPSILON));
     }
 

@@ -109,6 +109,9 @@ fn apply_overrides(profile: &mut DeviceProfile, overrides: &serde_json::Value) {
             port: None,
             byte_order: None,
             word_order: None,
+            response_timeout_ms: None,
+            retry_count: None,
+            throttle_delay_ms: None,
         },
     );
 

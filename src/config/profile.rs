@@ -61,6 +61,9 @@ pub struct ModbusDefaults {
     pub port: Option<u16>,
     pub byte_order: Option<ByteOrder>,
     pub word_order: Option<ByteOrder>,
+    pub response_timeout_ms: Option<u64>,
+    pub retry_count: Option<u8>,
+    pub throttle_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +211,10 @@ pub struct ModbusPointMapping {
     pub data_type: Option<ModbusDataType>,
     pub scale: Option<f64>,
     pub register_count: Option<u16>,
+    /// Extract a single bit from the register (0-15).
+    pub bit_offset: Option<u8>,
+    /// Extract masked bits from the register.
+    pub bit_mask: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

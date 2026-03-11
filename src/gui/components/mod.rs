@@ -1,13 +1,27 @@
 pub mod alarm_view;
+pub mod bacnet_device_alarms;
+pub mod bacnet_device_cov;
+pub mod bacnet_device_files;
+pub mod bacnet_device_trends;
+pub mod bacnet_network_tools;
 pub mod building_tree;
+pub mod collapsible;
 pub mod config_view;
 pub mod device_tree;
 pub mod discovery_view;
 pub mod floor_plan;
+pub mod login;
+
+pub mod modbus_device_diagnostics;
+pub mod modbus_device_registers;
 pub mod point_detail;
+pub mod programming_view;
+pub mod project_launcher;
 pub mod point_table;
 pub mod schedule_view;
 pub mod sidebar;
 pub mod toolbar;
 pub mod trend_chart;
+pub mod user_management;
+pub mod virtual_points_view;
 pub mod write_dialog;

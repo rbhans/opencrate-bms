@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::profile::PointValue;
 use crate::store::point_store::PointStatusFlags;
@@ -52,23 +52,102 @@ pub struct NodeCapabilities {
 }
 
 /// How this node connects to the physical world.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "protocol", rename_all = "snake_case")]
-pub enum ProtocolBinding {
-    Bacnet {
-        device_instance: u32,
-        object_type: String,
-        object_instance: u32,
-    },
-    Modbus {
-        host: String,
-        port: u16,
-        unit_id: u8,
-        register: u16,
-        data_type: String,
-        scale: f64,
-    },
-    Virtual,
+/// Protocol-agnostic: any protocol stores its config as JSON under a protocol tag.
+///
+/// Serialized as `{"protocol":"bacnet","config":{...}}`.
+/// Backward-compatible: also deserializes the legacy tagged-enum format
+/// `{"protocol":"bacnet","device_instance":1000,...}` by wrapping non-protocol
+/// fields into `config`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProtocolBinding {
+    /// Protocol identifier (e.g. "bacnet", "modbus", "virtual")
+    pub protocol: String,
+    /// Protocol-specific configuration (interpretation depends on protocol)
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for ProtocolBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize as a generic JSON map first
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::deserialize(deserializer)?;
+
+        let protocol = map
+            .remove("protocol")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "virtual".into());
+
+        // New format: has a "config" key
+        if let Some(config) = map.remove("config") {
+            return Ok(ProtocolBinding { protocol, config });
+        }
+
+        // Legacy format: remaining keys ARE the config (old tagged enum)
+        if map.is_empty() {
+            Ok(ProtocolBinding {
+                protocol,
+                config: serde_json::Value::Null,
+            })
+        } else {
+            Ok(ProtocolBinding {
+                protocol,
+                config: serde_json::Value::Object(map),
+            })
+        }
+    }
+}
+
+impl ProtocolBinding {
+    /// Create a virtual (no-protocol) binding.
+    pub fn virtual_binding() -> Self {
+        ProtocolBinding {
+            protocol: "virtual".into(),
+            config: serde_json::Value::Null,
+        }
+    }
+
+    /// Create a BACnet protocol binding.
+    pub fn bacnet(device_instance: u32, object_type: &str, object_instance: u32) -> Self {
+        ProtocolBinding {
+            protocol: "bacnet".into(),
+            config: serde_json::json!({
+                "device_instance": device_instance,
+                "object_type": object_type,
+                "object_instance": object_instance,
+            }),
+        }
+    }
+
+    /// Create a Modbus protocol binding.
+    pub fn modbus(host: &str, port: u16, unit_id: u8, register: u16, data_type: &str, scale: f64) -> Self {
+        ProtocolBinding {
+            protocol: "modbus".into(),
+            config: serde_json::json!({
+                "host": host,
+                "port": port,
+                "unit_id": unit_id,
+                "register": register,
+                "data_type": data_type,
+                "scale": scale,
+            }),
+        }
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        self.protocol == "virtual"
+    }
+
+    pub fn is_bacnet(&self) -> bool {
+        self.protocol == "bacnet"
+    }
+
+    pub fn is_modbus(&self) -> bool {
+        self.protocol == "modbus"
+    }
 }
 
 /// The unified object model. Every point/device/equipment/site/space is a Node.
@@ -177,5 +256,55 @@ mod tests {
             let parsed = NodeType::from_str(s).unwrap();
             assert_eq!(&parsed, nt);
         }
+    }
+
+    #[test]
+    fn protocol_binding_new_format() {
+        let b = ProtocolBinding::bacnet(1000, "analog-input", 1);
+        let json = serde_json::to_string(&b).unwrap();
+        let deser: ProtocolBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.protocol, "bacnet");
+        assert_eq!(deser.config["device_instance"], 1000);
+        assert_eq!(deser.config["object_type"], "analog-input");
+    }
+
+    #[test]
+    fn protocol_binding_legacy_bacnet() {
+        // Old tagged-enum format: {"protocol":"bacnet","device_instance":1000,...}
+        let legacy = r#"{"protocol":"bacnet","device_instance":1000,"object_type":"analog-input","object_instance":1}"#;
+        let b: ProtocolBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(b.protocol, "bacnet");
+        assert_eq!(b.config["device_instance"], 1000);
+        assert_eq!(b.config["object_type"], "analog-input");
+        assert_eq!(b.config["object_instance"], 1);
+    }
+
+    #[test]
+    fn protocol_binding_legacy_modbus() {
+        let legacy = r#"{"protocol":"modbus","host":"192.168.1.1","port":502,"unit_id":1,"register":100,"data_type":"uint16","scale":1.0}"#;
+        let b: ProtocolBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(b.protocol, "modbus");
+        assert_eq!(b.config["host"], "192.168.1.1");
+        assert_eq!(b.config["port"], 502);
+    }
+
+    #[test]
+    fn protocol_binding_legacy_virtual() {
+        let legacy = r#"{"protocol":"virtual"}"#;
+        let b: ProtocolBinding = serde_json::from_str(legacy).unwrap();
+        assert!(b.is_virtual());
+        assert_eq!(b.config, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn protocol_binding_custom_protocol() {
+        let b = ProtocolBinding {
+            protocol: "knx".into(),
+            config: serde_json::json!({"group_address": "1/2/3"}),
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        let deser: ProtocolBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.protocol, "knx");
+        assert_eq!(deser.config["group_address"], "1/2/3");
     }
 }

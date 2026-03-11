@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use dioxus::prelude::*;
 
+use crate::auth::Permission;
 use crate::config::profile::PointKind;
 use crate::gui::state::AppState;
 use crate::store::schedule_store::{
@@ -13,6 +14,7 @@ use crate::store::schedule_store::{
     compute_preview,
 };
 use crate::config::profile::PointValue;
+use rustbac_client::schedule::{CalendarEntry, TimeValue};
 
 // ----------------------------------------------------------------
 // Tab state
@@ -109,6 +111,7 @@ fn ScheduleBrowser(
     refresh_counter: Signal<u64>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let user_can_write = state.has_permission(Permission::ManageSchedules);
     let _refresh = *refresh_counter.read();
     let mut schedules = use_signal(Vec::<Schedule>::new);
     let mut conflicts = use_signal(Vec::<ScheduleConflict>::new);
@@ -279,11 +282,13 @@ fn ScheduleBrowser(
                         }
                     }
                 } else {
-                    button {
-                        class: "alarm-add-btn",
-                        style: "width: 100%;",
-                        onclick: move |_| show_new.set(true),
-                        "+ New Schedule"
+                    if user_can_write {
+                        button {
+                            class: "alarm-add-btn",
+                            style: "width: 100%;",
+                            onclick: move |_| show_new.set(true),
+                            "+ New Schedule"
+                        }
                     }
                 }
             }
@@ -319,6 +324,7 @@ fn WeeklyTab(schedule_id: ScheduleId, refresh_counter: Signal<u64>) -> Element {
     let _sched_name = sched.name.clone();
 
     rsx! {
+        BacnetScheduleSync { schedule_id, refresh_counter }
         div { class: "schedule-weekly",
             div { class: "schedule-weekly-header",
                 h3 { "Weekly Schedule" }
@@ -1395,6 +1401,407 @@ fn weekday_name(wd: u8) -> &'static str {
         _ => "???",
     }
 }
+
+// ----------------------------------------------------------------
+// BACnet Schedule Sync
+// ----------------------------------------------------------------
+
+const BACNET_DAY_NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+fn format_time_value(tv: &TimeValue) -> String {
+    let t = &tv.time;
+    format!("{:02}:{:02}:{:02} = {:?}", t.hour, t.minute, t.second, tv.value)
+}
+
+#[component]
+fn BacnetScheduleSync(schedule_id: ScheduleId, refresh_counter: Signal<u64>) -> Element {
+    let state = use_context::<AppState>();
+    let mut expanded = use_signal(|| false);
+    let mut device_instance = use_signal(|| "0".to_string());
+    let mut schedule_instance = use_signal(|| "0".to_string());
+    let mut status_msg = use_signal(|| Option::<String>::None);
+    let mut busy = use_signal(|| false);
+    let mut read_result = use_signal(|| Option::<Vec<Vec<TimeValue>>>::None);
+    let mut calendar_instance = use_signal(|| "0".to_string());
+    let mut default_result = use_signal(|| Option::<String>::None);
+    let mut calendar_result = use_signal(|| Option::<Vec<String>>::None);
+    let mut exception_result = use_signal(|| Option::<String>::None);
+
+    if !*expanded.read() {
+        return rsx! {
+            div { class: "schedule-bacnet-sync-toggle",
+                button {
+                    class: "schedule-tab",
+                    onclick: move |_| expanded.set(true),
+                    "BACnet Sync"
+                }
+            }
+        };
+    }
+
+    rsx! {
+        div { class: "schedule-bacnet-sync",
+            div { class: "schedule-bacnet-sync-header",
+                h4 { "BACnet Schedule Sync" }
+                button {
+                    class: "schedule-copy-btn",
+                    onclick: move |_| {
+                        expanded.set(false);
+                        read_result.set(None);
+                        default_result.set(None);
+                        calendar_result.set(None);
+                        exception_result.set(None);
+                        status_msg.set(None);
+                    },
+                    "Close"
+                }
+            }
+            div { class: "schedule-bacnet-sync-inputs",
+                div { class: "alarm-form-row",
+                    label { "Device Instance" }
+                    input {
+                        class: "schedule-value-input",
+                        r#type: "text",
+                        value: "{device_instance.read()}",
+                        oninput: move |evt| device_instance.set(evt.value()),
+                    }
+                }
+                div { class: "alarm-form-row",
+                    label { "Schedule Instance" }
+                    input {
+                        class: "schedule-value-input",
+                        r#type: "text",
+                        value: "{schedule_instance.read()}",
+                        oninput: move |evt| schedule_instance.set(evt.value()),
+                    }
+                }
+                div { class: "alarm-form-row",
+                    label { "Calendar Instance" }
+                    input {
+                        class: "schedule-value-input",
+                        r#type: "text",
+                        value: "{calendar_instance.read()}",
+                        oninput: move |evt| calendar_instance.set(evt.value()),
+                    }
+                }
+            }
+            div { class: "schedule-bacnet-sync-actions",
+                button {
+                    class: "alarm-save-btn",
+                    disabled: *busy.read(),
+                    onclick: {
+                        let bridge_handle = state.bacnet_bridge.clone();
+                        move |_| {
+                            let dev: u32 = match device_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid device instance".into())); return; }
+                            };
+                            let sched_inst: u32 = match schedule_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid schedule instance".into())); return; }
+                            };
+                            let bridge_handle = bridge_handle.clone();
+                            busy.set(true);
+                            status_msg.set(Some("Reading...".into()));
+                            spawn(async move {
+                                let guard = bridge_handle.lock().await;
+                                if let Some(ref bridge) = *guard {
+                                    match bridge.read_schedule(dev, sched_inst).await {
+                                        Ok(week) => {
+                                            status_msg.set(Some(format!("Read OK: {} days", week.len())));
+                                            read_result.set(Some(week));
+                                        }
+                                        Err(e) => {
+                                            status_msg.set(Some(format!("Read error: {e}")));
+                                            read_result.set(None);
+                                        }
+                                    }
+                                } else {
+                                    status_msg.set(Some("BACnet bridge not connected".into()));
+                                }
+                                drop(guard);
+                                busy.set(false);
+                            });
+                        }
+                    },
+                    if *busy.read() { "Reading..." } else { "Read from Device" }
+                }
+                button {
+                    class: "alarm-save-btn",
+                    disabled: *busy.read(),
+                    onclick: {
+                        let bridge_handle = state.bacnet_bridge.clone();
+                        let ss = state.schedule_store.clone();
+                        move |_| {
+                            let dev: u32 = match device_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid device instance".into())); return; }
+                            };
+                            let sched_inst: u32 = match schedule_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid schedule instance".into())); return; }
+                            };
+                            let bridge_handle = bridge_handle.clone();
+                            let ss = ss.clone();
+                            let sid = schedule_id;
+                            busy.set(true);
+                            status_msg.set(Some("Writing...".into()));
+                            spawn(async move {
+                                // Load the current schedule and convert to BACnet TimeValue format
+                                let sched = ss.get_schedule(sid).await;
+                                let Some(sched) = sched else {
+                                    status_msg.set(Some("Schedule not found".into()));
+                                    busy.set(false);
+                                    return;
+                                };
+
+                                // Convert internal weekly (Mon-Sun, 7 days) to BACnet (Sun-Sat, 7 days)
+                                let mut bacnet_week: Vec<Vec<TimeValue>> = Vec::with_capacity(7);
+                                // BACnet day 0 = Sunday = internal day 6
+                                bacnet_week.push(convert_day_slots_to_time_values(&sched.weekly[6]));
+                                // BACnet days 1-6 = Mon-Sat = internal days 0-5
+                                for day_idx in 0..6 {
+                                    bacnet_week.push(convert_day_slots_to_time_values(&sched.weekly[day_idx]));
+                                }
+
+                                let guard = bridge_handle.lock().await;
+                                if let Some(ref bridge) = *guard {
+                                    match bridge.write_schedule(dev, sched_inst, &bacnet_week).await {
+                                        Ok(()) => {
+                                            status_msg.set(Some("Write OK".into()));
+                                        }
+                                        Err(e) => {
+                                            status_msg.set(Some(format!("Write error: {e}")));
+                                        }
+                                    }
+                                } else {
+                                    status_msg.set(Some("BACnet bridge not connected".into()));
+                                }
+                                drop(guard);
+                                busy.set(false);
+                            });
+                        }
+                    },
+                    if *busy.read() { "Writing..." } else { "Write to Device" }
+                }
+                button {
+                    class: "alarm-save-btn",
+                    disabled: *busy.read(),
+                    onclick: {
+                        let bridge_handle = state.bacnet_bridge.clone();
+                        move |_| {
+                            let dev: u32 = match device_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid device instance".into())); return; }
+                            };
+                            let sched_inst: u32 = match schedule_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid schedule instance".into())); return; }
+                            };
+                            let bridge_handle = bridge_handle.clone();
+                            busy.set(true);
+                            status_msg.set(Some("Reading default...".into()));
+                            spawn(async move {
+                                let guard = bridge_handle.lock().await;
+                                if let Some(ref bridge) = *guard {
+                                    match bridge.read_schedule_default(dev, sched_inst).await {
+                                        Ok(value) => {
+                                            status_msg.set(Some("Read default OK".into()));
+                                            default_result.set(Some(format!("{:?}", value)));
+                                        }
+                                        Err(e) => {
+                                            status_msg.set(Some(format!("Read default error: {e}")));
+                                            default_result.set(None);
+                                        }
+                                    }
+                                } else {
+                                    status_msg.set(Some("BACnet bridge not connected".into()));
+                                }
+                                drop(guard);
+                                busy.set(false);
+                            });
+                        }
+                    },
+                    if *busy.read() { "Reading..." } else { "Read Default" }
+                }
+                button {
+                    class: "alarm-save-btn",
+                    disabled: *busy.read(),
+                    onclick: {
+                        let bridge_handle = state.bacnet_bridge.clone();
+                        move |_| {
+                            let dev: u32 = match device_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid device instance".into())); return; }
+                            };
+                            let cal_inst: u32 = match calendar_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid calendar instance".into())); return; }
+                            };
+                            let bridge_handle = bridge_handle.clone();
+                            busy.set(true);
+                            status_msg.set(Some("Reading calendar...".into()));
+                            spawn(async move {
+                                let guard = bridge_handle.lock().await;
+                                if let Some(ref bridge) = *guard {
+                                    match bridge.read_calendar(dev, cal_inst).await {
+                                        Ok(entries) => {
+                                            status_msg.set(Some(format!("Read calendar OK: {} entries", entries.len())));
+                                            let formatted: Vec<String> = entries.iter().map(|e| format_calendar_entry(e)).collect();
+                                            calendar_result.set(Some(formatted));
+                                        }
+                                        Err(e) => {
+                                            status_msg.set(Some(format!("Read calendar error: {e}")));
+                                            calendar_result.set(None);
+                                        }
+                                    }
+                                } else {
+                                    status_msg.set(Some("BACnet bridge not connected".into()));
+                                }
+                                drop(guard);
+                                busy.set(false);
+                            });
+                        }
+                    },
+                    if *busy.read() { "Reading..." } else { "Read Calendar" }
+                }
+                button {
+                    class: "alarm-save-btn",
+                    disabled: *busy.read(),
+                    onclick: {
+                        let bridge_handle = state.bacnet_bridge.clone();
+                        move |_| {
+                            let dev: u32 = match device_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid device instance".into())); return; }
+                            };
+                            let sched_inst: u32 = match schedule_instance.read().parse() {
+                                Ok(v) => v,
+                                Err(_) => { status_msg.set(Some("Invalid schedule instance".into())); return; }
+                            };
+                            let bridge_handle = bridge_handle.clone();
+                            busy.set(true);
+                            status_msg.set(Some("Reading exceptions...".into()));
+                            spawn(async move {
+                                let guard = bridge_handle.lock().await;
+                                if let Some(ref bridge) = *guard {
+                                    match bridge.read_exception_schedule(dev, sched_inst).await {
+                                        Ok(value) => {
+                                            status_msg.set(Some("Read exceptions OK".into()));
+                                            exception_result.set(Some(format!("{:?}", value)));
+                                        }
+                                        Err(e) => {
+                                            status_msg.set(Some(format!("Read exceptions error: {e}")));
+                                            exception_result.set(None);
+                                        }
+                                    }
+                                } else {
+                                    status_msg.set(Some("BACnet bridge not connected".into()));
+                                }
+                                drop(guard);
+                                busy.set(false);
+                            });
+                        }
+                    },
+                    if *busy.read() { "Reading..." } else { "Read Exceptions" }
+                }
+            }
+            if let Some(ref msg) = *status_msg.read() {
+                div { class: "schedule-bacnet-status",
+                    "{msg}"
+                }
+            }
+            if let Some(ref week) = *read_result.read() {
+                div { class: "schedule-bacnet-result",
+                    h4 { "BACnet Weekly Schedule (raw)" }
+                    for (day_idx, day) in week.iter().enumerate() {
+                        div { class: "schedule-bacnet-day",
+                            strong {
+                                "{BACNET_DAY_NAMES.get(day_idx).unwrap_or(&\"?\")}: "
+                            }
+                            if day.is_empty() {
+                                span { class: "schedule-empty-day", "(no entries)" }
+                            }
+                            for tv in day.iter() {
+                                div { class: "schedule-bacnet-tv",
+                                    "{format_time_value(tv)}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ref val) = *default_result.read() {
+                div { class: "schedule-bacnet-result",
+                    h4 { "Schedule Default Value" }
+                    div { "{val}" }
+                }
+            }
+            if let Some(ref entries) = *calendar_result.read() {
+                div { class: "schedule-bacnet-result",
+                    h4 { "Calendar Entries" }
+                    for entry in entries.iter() {
+                        div { "{entry}" }
+                    }
+                }
+            }
+            if let Some(ref val) = *exception_result.read() {
+                div { class: "schedule-bacnet-result",
+                    h4 { "Exception Schedule" }
+                    div { "{val}" }
+                }
+            }
+        }
+    }
+}
+
+/// Format a CalendarEntry for display.
+fn format_calendar_entry(entry: &CalendarEntry) -> String {
+    match entry {
+        CalendarEntry::Date(d) => {
+            format!("Date: {}/{}/{}", d.year_since_1900 as u16 + 1900, d.month, d.day)
+        }
+        CalendarEntry::Range(r) => {
+            format!(
+                "Range: {}/{}/{} - {}/{}/{}",
+                r.start.year_since_1900 as u16 + 1900, r.start.month, r.start.day,
+                r.end.year_since_1900 as u16 + 1900, r.end.month, r.end.day,
+            )
+        }
+        CalendarEntry::WeekNDay { month, week_of_month, day_of_week } => {
+            format!("WeekNDay: month={month}, week={week_of_month}, day={day_of_week}")
+        }
+    }
+}
+
+/// Convert internal DaySlots to BACnet TimeValue entries.
+fn convert_day_slots_to_time_values(slots: &DaySlots) -> Vec<TimeValue> {
+    use rustbac_client::ClientDataValue;
+    use rustbac_core::types::Time;
+
+    slots
+        .0
+        .iter()
+        .map(|slot| {
+            let time = Time {
+                hour: slot.time.hour,
+                minute: slot.time.minute,
+                second: 0,
+                hundredths: 0,
+            };
+            let value = match slot.value {
+                PointValue::Bool(b) => ClientDataValue::Enumerated(if b { 1 } else { 0 }),
+                PointValue::Integer(i) => ClientDataValue::Unsigned(i as u32),
+                PointValue::Float(f) => ClientDataValue::Real(f as f32),
+            };
+            TimeValue { time, value }
+        })
+        .collect()
+}
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
 
 fn format_time_ms(ms: i64) -> String {
     #[repr(C)]

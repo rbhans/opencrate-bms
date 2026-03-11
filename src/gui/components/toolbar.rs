@@ -1,29 +1,23 @@
 use dioxus::prelude::*;
 
-use crate::gui::state::{ActiveView, AppState, TrendDashboard};
+use crate::gui::state::{ActiveView, AppState, CloseAction, TrendDashboard};
 
 #[component]
-pub fn Toolbar() -> Element {
+pub fn Toolbar(on_close_project: EventHandler<CloseAction>) -> Element {
     let state = use_context::<AppState>();
     let active = state.active_view.read().clone();
     let title = state.view_title();
     let is_history = matches!(active, ActiveView::History);
 
     let has_dash = is_history && state.active_dashboard_id.read().is_some();
+    let project_name = state.project_meta.name.clone();
 
     rsx! {
         div { class: "toolbar",
             div { class: "toolbar-left",
                 // OpenCrate logo / file menu
-                button {
-                    class: "toolbar-btn logo-btn",
-                    title: "Menu",
-                    onclick: move |_| { /* TODO: file menu */ },
-                    img {
-                        src: asset!("/assets/opencrate_icon.svg"),
-                        width: "20",
-                        height: "20",
-                    }
+                FileMenu {
+                    on_close_project: move |action: CloseAction| on_close_project.call(action),
                 }
 
                 // Divider
@@ -76,9 +70,116 @@ pub fn Toolbar() -> Element {
             if !has_dash {
                 div { class: "toolbar-center",
                     span { class: "toolbar-title", "{title}" }
+                    span { class: "toolbar-project-name", "— {project_name}" }
                 }
             }
-            div { class: "toolbar-right" }
+            div { class: "toolbar-right",
+                UserIndicator {}
+            }
+        }
+    }
+}
+
+/// File menu dropdown triggered by the OpenCrate logo button.
+#[component]
+fn FileMenu(on_close_project: EventHandler<CloseAction>) -> Element {
+    let mut menu_open = use_signal(|| false);
+    let is_open = *menu_open.read();
+
+    rsx! {
+        div { class: "file-menu-anchor",
+            button {
+                class: if is_open { "toolbar-btn logo-btn active" } else { "toolbar-btn logo-btn" },
+                title: "File",
+                onclick: move |_| menu_open.toggle(),
+                img {
+                    src: asset!("/assets/opencrate_icon.svg"),
+                    width: "20",
+                    height: "20",
+                }
+            }
+
+            if is_open {
+                // Invisible backdrop to close menu on outside click
+                div {
+                    class: "file-menu-backdrop",
+                    onclick: move |_| menu_open.set(false),
+                }
+
+                div { class: "file-menu-dropdown",
+                    // New Project
+                    button {
+                        class: "file-menu-item",
+                        onclick: move |_| {
+                            menu_open.set(false);
+                            on_close_project.call(CloseAction::ToNewProject);
+                        },
+                        svg {
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            path { d: "M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 14h-3v3h-2v-3H8v-2h3v-3h2v3h3v2zm-3-7V3.5L18.5 9H13z" }
+                        }
+                        span { "New Project" }
+                    }
+
+                    // Open Project
+                    button {
+                        class: "file-menu-item",
+                        onclick: move |_| {
+                            menu_open.set(false);
+                            on_close_project.call(CloseAction::ToRecent);
+                        },
+                        svg {
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            path { d: "M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" }
+                        }
+                        span { "Open Project" }
+                    }
+
+                    div { class: "file-menu-separator" }
+
+                    // Close Project
+                    button {
+                        class: "file-menu-item",
+                        onclick: move |_| {
+                            menu_open.set(false);
+                            on_close_project.call(CloseAction::ToRecent);
+                        },
+                        svg {
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            path { d: "M10.09 15.59L11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67l-2.58 2.59zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" }
+                        }
+                        span { "Close Project" }
+                    }
+
+                    div { class: "file-menu-separator" }
+
+                    // Exit
+                    button {
+                        class: "file-menu-item",
+                        onclick: move |_| {
+                            let window = dioxus::desktop::window();
+                            window.close();
+                        },
+                        svg {
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            path { d: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" }
+                        }
+                        span { "Exit" }
+                    }
+                }
+            }
         }
     }
 }
@@ -209,6 +310,55 @@ fn AlarmNavButton(active_view: ActiveView) -> Element {
                 }
                 if has_alarms {
                     span { class: "alarm-badge", "{count}" }
+                }
+            }
+        }
+    }
+}
+
+/// User indicator with logout dropdown in toolbar-right.
+#[component]
+fn UserIndicator() -> Element {
+    let mut state = use_context::<AppState>();
+    let mut dropdown_open = use_signal(|| false);
+
+    let user = state.current_user.read().clone();
+    let Some(user) = user else {
+        return rsx! {};
+    };
+
+    let role_class = format!("role-{}", user.role.to_string().to_lowercase());
+
+    rsx! {
+        div { class: "user-indicator",
+            button {
+                class: "user-indicator-btn",
+                onclick: move |_| dropdown_open.toggle(),
+                span { class: "user-indicator-name", "{user.display_name}" }
+                span { class: "user-role-badge {role_class}", "{user.role.label()}" }
+            }
+
+            if *dropdown_open.read() {
+                div {
+                    class: "file-menu-backdrop",
+                    onclick: move |_| dropdown_open.set(false),
+                }
+                div { class: "user-dropdown",
+                    button {
+                        class: "file-menu-item",
+                        onclick: move |_| {
+                            dropdown_open.set(false);
+                            state.current_user.set(None);
+                        },
+                        svg {
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            path { d: "M10.09 15.59L11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67l-2.58 2.59zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" }
+                        }
+                        span { "Log Out" }
+                    }
                 }
             }
         }

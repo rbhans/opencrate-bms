@@ -1,21 +1,48 @@
+use std::pin::Pin;
+
+use crate::bridge::traits::BridgeError;
 use crate::config::profile::PointValue;
 use crate::node::NodeId;
 use crate::store::alarm_store::{AlarmConfig, AlarmState};
 
 // ----------------------------------------------------------------
-// Plugin traits — trait boundaries for future dynamic loading
+// Plugin traits — trait boundaries for extensible plugin system
 // ----------------------------------------------------------------
 
-/// Plugin that provides a protocol driver (BACnet, Modbus, etc.)
-pub trait ProtocolDriverPlugin: Send + Sync {
-    fn name(&self) -> &str;
-    fn create_driver(&self, config: &serde_json::Value) -> Box<dyn ProtocolDriverBoxed>;
+/// Plugin that provides a protocol bridge (BACnet, Modbus, KNX, etc.)
+///
+/// Implement this trait to add a new protocol to OpenCrate.
+/// Register it in the PluginRegistry at startup.
+pub trait ProtocolPlugin: Send + Sync {
+    /// Protocol identifier string (e.g. "bacnet", "modbus", "knx")
+    fn protocol_id(&self) -> &str;
+
+    /// Human-readable display name (e.g. "BACnet", "Modbus TCP/RTU")
+    fn display_name(&self) -> &str;
 }
 
-/// Object-safe version of ProtocolDriver for use in plugin registry.
-/// The real ProtocolDriver uses RPITIT and can't be boxed directly.
-pub trait ProtocolDriverBoxed: Send {
-    fn protocol_name(&self) -> &str;
+/// A running protocol bridge handle — protocol-agnostic interface.
+///
+/// This is the object-safe trait that all bridges expose.
+/// Protocol-specific operations are available via `as_any()` downcasting.
+pub trait ProtocolBridgeHandle: Send + Sync {
+    /// Write a value to a point on this bridge.
+    fn write_point(
+        &self,
+        device_id: &str,
+        point_id: &str,
+        value: PointValue,
+        priority: Option<u8>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), BridgeError>> + Send + '_>>;
+
+    /// Stop the bridge and clean up resources.
+    fn stop(&mut self) -> Pin<Box<dyn std::future::Future<Output = Result<(), BridgeError>> + Send + '_>>;
+
+    /// Downcast to protocol-specific bridge type (e.g. BacnetBridge, ModbusBridge).
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Mutable downcast to protocol-specific bridge type.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Plugin that provides a history storage backend.
@@ -125,7 +152,7 @@ pub enum ImportExportError {
 /// Central registry for all plugins. Plugins are registered at startup.
 /// No dynamic loading — all plugins are compiled in.
 pub struct PluginRegistry {
-    pub protocol_drivers: Vec<Box<dyn ProtocolDriverPlugin>>,
+    pub protocol_plugins: Vec<Box<dyn ProtocolPlugin>>,
     pub history_backends: Vec<Box<dyn HistoryBackend>>,
     pub alarm_evaluators: Vec<Box<dyn AlarmEvaluator>>,
     pub logic_engines: Vec<Box<dyn LogicEnginePlugin>>,
@@ -135,7 +162,7 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     pub fn new() -> Self {
         PluginRegistry {
-            protocol_drivers: Vec::new(),
+            protocol_plugins: Vec::new(),
             history_backends: Vec::new(),
             alarm_evaluators: Vec::new(),
             logic_engines: Vec::new(),
@@ -143,8 +170,8 @@ impl PluginRegistry {
         }
     }
 
-    pub fn register_protocol_driver(&mut self, plugin: Box<dyn ProtocolDriverPlugin>) {
-        self.protocol_drivers.push(plugin);
+    pub fn register_protocol(&mut self, plugin: Box<dyn ProtocolPlugin>) {
+        self.protocol_plugins.push(plugin);
     }
 
     pub fn register_history_backend(&mut self, backend: Box<dyn HistoryBackend>) {
@@ -163,11 +190,16 @@ impl PluginRegistry {
         self.import_export.push(plugin);
     }
 
-    pub fn find_protocol_driver(&self, name: &str) -> Option<&dyn ProtocolDriverPlugin> {
-        self.protocol_drivers
+    pub fn find_protocol(&self, protocol_id: &str) -> Option<&dyn ProtocolPlugin> {
+        self.protocol_plugins
             .iter()
-            .find(|p| p.name() == name)
+            .find(|p| p.protocol_id() == protocol_id)
             .map(|p| p.as_ref())
+    }
+
+    /// Get all registered protocol IDs.
+    pub fn protocol_ids(&self) -> Vec<&str> {
+        self.protocol_plugins.iter().map(|p| p.protocol_id()).collect()
     }
 }
 
@@ -205,8 +237,9 @@ mod tests {
     #[test]
     fn registry_creation() {
         let reg = PluginRegistry::new();
-        assert!(reg.protocol_drivers.is_empty());
+        assert!(reg.protocol_plugins.is_empty());
         assert!(reg.history_backends.is_empty());
+        assert!(reg.protocol_ids().is_empty());
     }
 
     #[test]

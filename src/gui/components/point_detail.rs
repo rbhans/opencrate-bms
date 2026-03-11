@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use crate::auth::Permission;
 use crate::config::profile::PointAccess;
 use crate::gui::state::AppState;
 
@@ -115,7 +116,7 @@ pub fn PointDetail() -> Element {
                 }
             }
 
-            if is_writable {
+            if is_writable && state.has_permission(Permission::WritePoints) {
                 WriteDialog {
                     device_id: device_id.clone(),
                     point_id: point_id.clone(),

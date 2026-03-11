@@ -5,3 +5,4 @@ pub mod history_store;
 pub mod node_store;
 pub mod point_store;
 pub mod schedule_store;
+pub mod user_store;

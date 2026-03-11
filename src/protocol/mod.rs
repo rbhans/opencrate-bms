@@ -1,23 +1,19 @@
 pub mod normalize;
 
 use crate::config::profile::PointValue;
-use crate::node::ProtocolBinding;
 
 /// Raw protocol value from a bridge before normalization.
+/// Protocol-agnostic: any protocol pushes raw data as JSON with a protocol tag.
 #[derive(Debug, Clone)]
-pub enum RawProtocolValue {
-    Bacnet {
-        device_instance: u32,
-        object_type: String,
-        object_instance: u32,
-        value: serde_json::Value,
-    },
-    Modbus {
-        host: String,
-        unit_id: u8,
-        register: u16,
-        raw_bytes: Vec<u8>,
-    },
+pub struct RawProtocolValue {
+    /// Protocol identifier (e.g. "bacnet", "modbus", "knx")
+    pub protocol: String,
+    /// Device key within the protocol (e.g. device instance, host:unit combo)
+    pub device_key: String,
+    /// Point key within the device (e.g. object type+instance, register address)
+    pub point_key: String,
+    /// Raw data from the protocol — interpretation is protocol-specific
+    pub raw_data: serde_json::Value,
 }
 
 /// Trait for protocol drivers — replaces the old PointSource trait.
@@ -38,6 +34,8 @@ pub trait ProtocolDriver: Send {
 
     fn protocol_name(&self) -> &str;
 }
+
+use crate::node::ProtocolBinding;
 
 /// Receives raw values from protocol drivers.
 pub trait ValueSink: Send + Sync {
