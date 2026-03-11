@@ -1,4 +1,5 @@
 pub mod alarm_view;
+pub mod audit_log_view;
 pub mod bacnet_device_alarms;
 pub mod bacnet_device_cov;
 pub mod bacnet_device_files;

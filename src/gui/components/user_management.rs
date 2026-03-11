@@ -171,6 +171,8 @@ fn AddUserForm(
     let mut confirm = use_signal(String::new);
     let mut error = use_signal(|| Option::<String>::None);
     let mut loading = use_signal(|| false);
+    let state = use_context::<crate::gui::state::AppState>();
+    let create_audit = state.clone();
 
     let do_create = move |_| {
         let uname = username.read().clone();
@@ -195,6 +197,7 @@ fn AddUserForm(
         loading.set(true);
         error.set(None);
         let store = user_store.clone();
+        let audit = create_audit.clone();
 
         spawn(async move {
             let pw_clone = pw.clone();
@@ -217,6 +220,7 @@ fn AddUserForm(
                 .unwrap_or_default()
                 .as_millis() as i64;
 
+            let uname_audit = uname.clone();
             let user = User {
                 id: uuid::Uuid::new_v4().to_string(),
                 username: uname,
@@ -230,6 +234,11 @@ fn AddUserForm(
 
             match store.create_user(user).await {
                 Ok(_) => {
+                    audit.audit(
+                        crate::store::audit_store::AuditEntryBuilder::new(
+                            crate::store::audit_store::AuditAction::CreateUser, "user",
+                        ).details(&format!("username={}", uname_audit)),
+                    );
                     loading.set(false);
                     on_created.call(());
                 }
@@ -337,6 +346,10 @@ fn UserDetailForm(
     let mut success = use_signal(|| Option::<String>::None);
     let mut loading = use_signal(|| false);
     let mut confirm_delete = use_signal(|| false);
+    let state = use_context::<crate::gui::state::AppState>();
+    let save_audit = state.clone();
+    let pw_audit = state.clone();
+    let del_audit = state.clone();
 
     // Reset form when user changes
     let user_id = user.id.clone();
@@ -357,6 +370,7 @@ fn UserDetailForm(
         move |_| {
             let store = store.clone();
             let uid = uid.clone();
+            let audit = save_audit.clone();
             let dn = display_name.read().clone();
             let r = role.read().clone();
             let dis = *disabled.read();
@@ -365,8 +379,14 @@ fn UserDetailForm(
             success.set(None);
 
             spawn(async move {
+                let details = format!("display_name={dn} role={r:?} disabled={dis}");
                 match store.update_user(&uid, &dn, r, dis).await {
                     Ok(()) => {
+                        audit.audit(
+                            crate::store::audit_store::AuditEntryBuilder::new(
+                                crate::store::audit_store::AuditAction::UpdateUser, "user",
+                            ).resource_id(&uid).details(&details),
+                        );
                         success.set(Some("User updated.".into()));
                         on_updated.call(());
                     }
@@ -397,6 +417,7 @@ fn UserDetailForm(
             }
             let store = store.clone();
             let uid = uid.clone();
+            let audit = pw_audit.clone();
             loading.set(true);
             error.set(None);
             success.set(None);
@@ -418,6 +439,11 @@ fn UserDetailForm(
                 };
                 match store.update_password(&uid, &hash).await {
                     Ok(()) => {
+                        audit.audit(
+                            crate::store::audit_store::AuditEntryBuilder::new(
+                                crate::store::audit_store::AuditAction::ChangePassword, "user",
+                            ).resource_id(&uid),
+                        );
                         success.set(Some("Password updated.".into()));
                         new_password.set(String::new());
                         confirm_password.set(String::new());
@@ -439,10 +465,18 @@ fn UserDetailForm(
             }
             let store = store.clone();
             let uid = uid.clone();
+            let audit = del_audit.clone();
             loading.set(true);
             spawn(async move {
                 match store.delete_user(&uid).await {
-                    Ok(()) => on_deleted.call(()),
+                    Ok(()) => {
+                        audit.audit(
+                            crate::store::audit_store::AuditEntryBuilder::new(
+                                crate::store::audit_store::AuditAction::DeleteUser, "user",
+                            ).resource_id(&uid),
+                        );
+                        on_deleted.call(());
+                    }
                     Err(e) => error.set(Some(format!("{e}"))),
                 }
                 loading.set(false);
@@ -610,6 +644,7 @@ fn RolePermissionsView() -> Element {
 
     let toggle_permission = {
         let user_store = user_store.clone();
+        let state2 = state.clone();
         move |role: UserRole, perm: Permission, current: bool| {
             let store = user_store.clone();
             let new_val = !current;
@@ -618,6 +653,11 @@ fn RolePermissionsView() -> Element {
                 let mut rp = role_perms.write();
                 rp.for_role_mut(&role).set(perm, new_val);
             }
+            state2.audit(
+                crate::store::audit_store::AuditEntryBuilder::new(
+                    crate::store::audit_store::AuditAction::ChangeRolePermission, "role_permission",
+                ).details(&format!("{:?}.{} = {new_val}", role, perm.key())),
+            );
             // Persist
             spawn(async move {
                 if let Err(e) = store.set_role_permission(&role, perm.key(), new_val).await {

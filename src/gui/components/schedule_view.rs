@@ -213,6 +213,7 @@ fn ScheduleBrowser(
                                 class: "alarm-save-btn",
                                 onclick: {
                                     let ss = state.schedule_store.clone();
+                                    let audit_state = state.clone();
                                     move |_| {
                                         let name = new_name.read().trim().to_string();
                                         if name.is_empty() {
@@ -251,9 +252,15 @@ fn ScheduleBrowser(
                                         };
                                         let ss = ss.clone();
                                         let dv = default_val.clone();
+                                        let audit_state = audit_state.clone();
                                         spawn(async move {
                                             match ss.create_schedule(&name, "", vtype, dv, weekly).await {
                                                 Ok(id) => {
+                                                    audit_state.audit(
+                                                        crate::store::audit_store::AuditEntryBuilder::new(
+                                                            crate::store::audit_store::AuditAction::CreateSchedule, "schedule",
+                                                        ).resource_id(&format!("{id}")).details(&name),
+                                                    );
                                                     selected_schedule.set(Some(id));
                                                     show_new.set(false);
                                                     new_name.set(String::new());
@@ -1277,11 +1284,18 @@ fn SchedulePropertiesPanel(
                                 class: "alarm-delete-btn confirm",
                                 onclick: {
                                     let ss = state.schedule_store.clone();
+                                    let del_audit = state.clone();
                                     move |_| {
                                         let ss = ss.clone();
                                         let sid = schedule_id;
+                                        let audit_state = del_audit.clone();
                                         spawn(async move {
                                             let _ = ss.delete_schedule(sid).await;
+                                            audit_state.audit(
+                                                crate::store::audit_store::AuditEntryBuilder::new(
+                                                    crate::store::audit_store::AuditAction::DeleteSchedule, "schedule",
+                                                ).resource_id(&format!("{sid}")),
+                                            );
                                             selected_schedule.set(None);
                                             { let v = *refresh_counter.peek(); refresh_counter.set(v + 1); }
                                         });

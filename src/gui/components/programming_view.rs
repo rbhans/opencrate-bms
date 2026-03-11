@@ -229,6 +229,7 @@ fn ProgramBrowser(
                                 disabled: new_name.read().trim().is_empty(),
                                 onclick: {
                                     let ps = state.program_store.clone();
+                                    let audit_state = state.clone();
                                     move |_| {
                                         let name = new_name.read().trim().to_string();
                                         if name.is_empty() { return; }
@@ -239,6 +240,7 @@ fn ProgramBrowser(
                                             Trigger::Periodic { interval_ms: 5000 }
                                         };
                                         let ps = ps.clone();
+                                        let audit_state = audit_state.clone();
                                         spawn(async move {
                                             let now = std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
@@ -258,6 +260,11 @@ fn ProgramBrowser(
                                             };
                                             match ps.create(prog).await {
                                                 Ok(()) => {
+                                                    audit_state.audit(
+                                                        crate::store::audit_store::AuditEntryBuilder::new(
+                                                            crate::store::audit_store::AuditAction::CreateProgram, "program",
+                                                        ).resource_id(&id).details(&name),
+                                                    );
                                                     status.set(None);
                                                     selected_program.set(Some(id));
                                                     { let v = *refresh_counter.peek(); refresh_counter.set(v + 1); }
@@ -2260,11 +2267,22 @@ fn ProgramPropertiesPanel(
                             let ps = state.program_store.clone();
                             let pid = prog.id.clone();
                             let enabled = prog.enabled;
+                            let audit_state = state.clone();
                             move |_| {
                                 let ps = ps.clone();
                                 let pid = pid.clone();
+                                let audit_state = audit_state.clone();
                                 spawn(async move {
                                     let _ = ps.set_enabled(&pid, !enabled).await;
+                                    let action = if !enabled {
+                                        crate::store::audit_store::AuditAction::EnableProgram
+                                    } else {
+                                        crate::store::audit_store::AuditAction::DisableProgram
+                                    };
+                                    audit_state.audit(
+                                        crate::store::audit_store::AuditEntryBuilder::new(action, "program")
+                                            .resource_id(&pid),
+                                    );
                                     { let v = *refresh_counter.peek(); refresh_counter.set(v + 1); }
                                 });
                             }
@@ -2280,11 +2298,18 @@ fn ProgramPropertiesPanel(
                         onclick: {
                             let ps = state.program_store.clone();
                             let pid = prog.id.clone();
+                            let audit_state = state.clone();
                             move |_| {
                                 let ps = ps.clone();
                                 let pid = pid.clone();
+                                let audit_state = audit_state.clone();
                                 spawn(async move {
                                     let _ = ps.delete(&pid).await;
+                                    audit_state.audit(
+                                        crate::store::audit_store::AuditEntryBuilder::new(
+                                            crate::store::audit_store::AuditAction::DeleteProgram, "program",
+                                        ).resource_id(&pid),
+                                    );
                                     selected_program.set(None);
                                     { let v = *refresh_counter.peek(); refresh_counter.set(v + 1); }
                                 });

@@ -552,9 +552,22 @@ fn AckAllButton() -> Element {
             class: "alarm-ack-all-btn",
             onclick: move |_| {
                 let store = state.alarm_store.clone();
+                let audit = state.audit_store.clone();
+                let user = state.current_user.read().clone();
                 spawn(async move {
                     match store.acknowledge_all().await {
-                        Ok(count) => ack_result.set(Some(format!("Acknowledged {count} alarm(s)"))),
+                        Ok(count) => {
+                            ack_result.set(Some(format!("Acknowledged {count} alarm(s)")));
+                            let (uid, uname) = match user.as_ref() {
+                                Some(u) => (u.id.as_str(), u.username.as_str()),
+                                None => ("system", "system"),
+                            };
+                            let _ = audit.log_action(uid, uname,
+                                crate::store::audit_store::AuditEntryBuilder::new(
+                                    crate::store::audit_store::AuditAction::AcknowledgeAllAlarms, "alarm",
+                                ).details(&format!("{count} alarms")),
+                            ).await;
+                        }
                         Err(e) => ack_result.set(Some(format!("Error: {e}"))),
                     }
                 });
@@ -595,11 +608,26 @@ fn ActiveAlarmRow(alarm: ActiveAlarm) -> Element {
                         onclick: move |_| {
                             let store = state.alarm_store.clone();
                             let bridge = state.bacnet_bridge.clone();
+                            let audit = state.audit_store.clone();
+                            let ack_user = state.current_user.read().clone();
                             let dev_id = alarm.device_id.clone();
                             let point_id = alarm.point_id.clone();
                             let alarm_type = alarm.alarm_type.clone();
                             spawn(async move {
                                 let _ = store.acknowledge(config_id).await;
+                                // Audit log
+                                {
+                                    let (uid, uname) = match ack_user.as_ref() {
+                                        Some(u) => (u.id.as_str(), u.username.as_str()),
+                                        None => ("system", "system"),
+                                    };
+                                    let _ = audit.log_action(uid, uname,
+                                        crate::store::audit_store::AuditEntryBuilder::new(
+                                            crate::store::audit_store::AuditAction::AcknowledgeAlarm, "alarm",
+                                        ).resource_id(&format!("{dev_id}/{point_id}"))
+                                         .details(&format!("config_id={config_id}")),
+                                    ).await;
+                                }
                                 // Also acknowledge on the remote BACnet device
                                 if let Some(instance) = dev_id.strip_prefix("bacnet-").and_then(|s| s.parse::<u32>().ok()) {
                                     // Parse point_id to extract BACnet ObjectId.

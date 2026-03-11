@@ -348,6 +348,11 @@ fn UserIndicator() -> Element {
                         class: "file-menu-item",
                         onclick: move |_| {
                             dropdown_open.set(false);
+                            state.audit(
+                                crate::store::audit_store::AuditEntryBuilder::new(
+                                    crate::store::audit_store::AuditAction::Logout, "session",
+                                ),
+                            );
                             state.current_user.set(None);
                         },
                         svg {

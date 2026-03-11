@@ -10,6 +10,7 @@ use crate::store::entity_store::Entity;
 
 use crate::auth::Permission;
 
+use super::audit_log_view::AuditLogView;
 use super::discovery_view::DiscoveryView;
 use super::programming_view::ProgrammingView;
 use super::user_management::UserManagementView;
@@ -26,6 +27,7 @@ pub enum ConfigSection {
     Programming,
     VirtualPoints,
     Users,
+    AuditLog,
 }
 
 impl ConfigSection {
@@ -36,6 +38,7 @@ impl ConfigSection {
             Self::Programming => "Programming",
             Self::VirtualPoints => "Virtual Points",
             Self::Users => "Users",
+            Self::AuditLog => "Audit Log",
         }
     }
 
@@ -49,6 +52,7 @@ impl ConfigSection {
         ];
         if is_admin {
             sections.push(Self::Users);
+            sections.push(Self::AuditLog);
         }
         sections
     }
@@ -93,6 +97,7 @@ pub fn ConfigView() -> Element {
                     ConfigSection::Programming => rsx! { ProgrammingView {} },
                     ConfigSection::VirtualPoints => rsx! { VirtualPointsView {} },
                     ConfigSection::Users => rsx! { UserManagementView {} },
+                    ConfigSection::AuditLog => rsx! { AuditLogView {} },
                 }
             }
         }

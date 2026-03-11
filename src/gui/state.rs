@@ -19,6 +19,7 @@ use crate::store::node_store::NodeStore;
 use crate::store::point_store::PointStore;
 use crate::store::schedule_store::ScheduleStore;
 use crate::auth::{AllRolePermissions, Permission};
+use crate::store::audit_store::{AuditEntryBuilder, AuditStore};
 use crate::store::user_store::{User, UserStore};
 use crate::logic::store::ProgramStore;
 
@@ -472,6 +473,8 @@ pub struct AppState {
     pub user_store: UserStore,
     /// Per-role permission configuration.
     pub role_permissions: Signal<AllRolePermissions>,
+    /// Audit trail store for logging user actions.
+    pub audit_store: AuditStore,
 }
 
 impl AppState {
@@ -514,6 +517,19 @@ impl AppState {
             Some(u) => crate::auth::has_permission(u, perm, &perms),
             None => false,
         }
+    }
+
+    /// Log an audit entry for the current user. Fire-and-forget.
+    pub fn audit(&self, builder: AuditEntryBuilder) {
+        let user = self.current_user.read();
+        let (uid, uname) = match user.as_ref() {
+            Some(u) => (u.id.clone(), u.username.clone()),
+            None => ("system".into(), "system".into()),
+        };
+        let store = self.audit_store.clone();
+        spawn(async move {
+            let _ = store.log_action(&uid, &uname, builder).await;
+        });
     }
 }
 

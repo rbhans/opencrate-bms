@@ -19,6 +19,7 @@ use crate::store::node_store::start_node_store_with_path;
 use crate::store::point_store::{PointKey, PointStatusFlags, PointStore};
 use crate::store::schedule_store::start_schedule_engine_with_path;
 use crate::auth::AllRolePermissions;
+use crate::store::audit_store::start_audit_store_with_path;
 use crate::store::user_store::{start_user_store_with_path, User, UserStore};
 use crate::logic::engine::ExecutionEngine;
 use crate::logic::store::start_program_store_with_path;
@@ -302,6 +303,10 @@ fn ProjectApp(
     let quick_trend_point = use_signal(|| Option::<String>::None);
     let quick_trend_range = use_signal(|| crate::gui::state::TrendRange::Hour1);
 
+    let audit_store = use_hook(|| {
+        start_audit_store_with_path(&project_paths.db_path("audit.db"))
+    });
+
     // Shared bridge handles — created before AppState so discovery view can access them
     let bacnet_bridge: Arc<Mutex<Option<BacnetBridge>>> = use_hook(|| Arc::new(Mutex::new(None)));
     let modbus_bridge: Arc<Mutex<Option<ModbusBridge>>> = use_hook(|| Arc::new(Mutex::new(None)));
@@ -345,6 +350,7 @@ fn ProjectApp(
         current_user,
         user_store: user_store.clone(),
         role_permissions,
+        audit_store: audit_store.clone(),
     });
     use_context_provider(|| app_state.clone());
 
@@ -500,11 +506,15 @@ fn ProjectApp(
     let write_rx_slot = write_rx.clone();
     let bacnet_for_write = bacnet_bridge.clone();
     let modbus_for_write = modbus_bridge.clone();
+    let write_audit = audit_store.clone();
+    let write_user = current_user;
     use_hook(move || {
         spawn(async move {
             let mut rx = write_rx_slot.lock().await.take().unwrap();
             while let Some(cmd) = rx.recv().await {
                 let mut written = false;
+                let mut write_failed: Option<String> = None;
+                let resource_id = format!("{}/{}", cmd.device_id, cmd.point_id);
 
                 // Try Modbus bridge first (matches by instance_id)
                 if let Some(ref bridge) = *modbus_for_write.lock().await {
@@ -518,14 +528,15 @@ fn ProjectApp(
                         }
                         Err(e) => {
                             eprintln!("Modbus write error: {e}");
-                            write_error.set(Some(format!("Write failed: {e}")));
-                            continue;
+                            let msg = format!("Write failed: {e}");
+                            write_error.set(Some(msg.clone()));
+                            write_failed = Some(msg);
                         }
                     }
                 }
 
                 // Try BACnet bridge
-                if !written {
+                if !written && write_failed.is_none() {
                     if let Some(ref bridge) = *bacnet_for_write.lock().await {
                         match bridge.write_point(&cmd.device_id, &cmd.point_id, cmd.value.clone(), cmd.priority).await {
                             Ok(()) => {
@@ -533,11 +544,38 @@ fn ProjectApp(
                             }
                             Err(e) => {
                                 eprintln!("BACnet write error: {e}");
-                                write_error.set(Some(format!("Write failed: {e}")));
-                                continue;
+                                let msg = format!("Write failed: {e}");
+                                write_error.set(Some(msg.clone()));
+                                write_failed = Some(msg);
                             }
                         }
                     }
+                }
+
+                // Audit log the write attempt
+                {
+                    use crate::store::audit_store::{AuditAction, AuditEntryBuilder};
+                    let user = write_user.read();
+                    let (uid, uname) = match user.as_ref() {
+                        Some(u) => (u.id.as_str().to_string(), u.username.clone()),
+                        None => ("system".into(), "system".into()),
+                    };
+                    let details = format!("value={:?} priority={:?}", cmd.value, cmd.priority);
+                    let builder = if let Some(ref err) = write_failed {
+                        AuditEntryBuilder::new(AuditAction::WritePoint, "point")
+                            .resource_id(&resource_id)
+                            .details(&details)
+                            .failure(err)
+                    } else {
+                        AuditEntryBuilder::new(AuditAction::WritePoint, "point")
+                            .resource_id(&resource_id)
+                            .details(&details)
+                    };
+                    let _ = write_audit.log_action(&uid, &uname, builder).await;
+                }
+
+                if write_failed.is_some() {
+                    continue;
                 }
 
                 // Also update local store so UI reflects immediately

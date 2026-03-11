@@ -580,15 +580,28 @@ pub fn DiscoveryView() -> Element {
                                     let ignore_id = accept_id.clone();
                                     let svc = state.discovery_service.clone();
                                     let svc2 = state.discovery_service.clone();
+                                    let accept_audit = state.clone();
                                     rsx! {
                                         button {
                                             class: "discovery-action-btn accept primary",
                                             onclick: move |_| {
                                                 let svc = svc.clone();
                                                 let id = accept_id.clone();
+                                                let audit_state = accept_audit.clone();
                                                 spawn(async move {
                                                     if let Err(e) = svc.accept_device(&id).await {
                                                         eprintln!("Accept failed: {e}");
+                                                        audit_state.audit(
+                                                            crate::store::audit_store::AuditEntryBuilder::new(
+                                                                crate::store::audit_store::AuditAction::AcceptDevice, "device",
+                                                            ).resource_id(&id).failure(&format!("{e}")),
+                                                        );
+                                                    } else {
+                                                        audit_state.audit(
+                                                            crate::store::audit_store::AuditEntryBuilder::new(
+                                                                crate::store::audit_store::AuditAction::AcceptDevice, "device",
+                                                            ).resource_id(&id),
+                                                        );
                                                     }
                                                     bump(&mut refresh_counter);
                                                 });
@@ -810,16 +823,31 @@ fn render_pending_device(
                 if state.has_permission(Permission::ManageDiscovery) {
                     button {
                         class: "discovery-action-btn accept",
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            let svc = svc.clone();
-                            let id = dev_id2.clone();
-                            spawn(async move {
-                                if let Err(e) = svc.accept_device(&id).await {
-                                    eprintln!("Accept failed: {e}");
-                                }
-                                bump(&mut refresh_counter);
-                            });
+                        onclick: {
+                            let list_audit = state.clone();
+                            move |evt: Event<MouseData>| {
+                                evt.stop_propagation();
+                                let svc = svc.clone();
+                                let id = dev_id2.clone();
+                                let audit_state = list_audit.clone();
+                                spawn(async move {
+                                    if let Err(e) = svc.accept_device(&id).await {
+                                        eprintln!("Accept failed: {e}");
+                                        audit_state.audit(
+                                            crate::store::audit_store::AuditEntryBuilder::new(
+                                                crate::store::audit_store::AuditAction::AcceptDevice, "device",
+                                            ).resource_id(&id).failure(&format!("{e}")),
+                                        );
+                                    } else {
+                                        audit_state.audit(
+                                            crate::store::audit_store::AuditEntryBuilder::new(
+                                                crate::store::audit_store::AuditAction::AcceptDevice, "device",
+                                            ).resource_id(&id),
+                                        );
+                                    }
+                                    bump(&mut refresh_counter);
+                                });
+                            }
                         },
                         "Accept"
                     }

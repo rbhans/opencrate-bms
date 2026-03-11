@@ -1,4 +1,5 @@
 pub mod alarm_store;
+pub mod audit_store;
 pub mod discovery_store;
 pub mod entity_store;
 pub mod history_store;
